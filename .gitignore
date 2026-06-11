@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Credentials — NEVER commit these
+.env
+*.env
+
+# Logs and generated files
+logs/trading_bot.log
+signals/signal_log.csv
+signals/backtest_results.csv
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# MT5 executor pycache
+mt5-executor/__pycache__/
