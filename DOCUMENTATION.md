@@ -370,16 +370,7 @@ Called once at server startup. MT5 desktop app must be open and logged into your
 
 All settings are in [`forex_system/config/settings.py`](forex_system/config/settings.py).
 
-### MT5 Connection (Windows server only)
-```python
-MT5_CONFIG = {
-    "login":    10401216,
-    "password": "...",
-    "server":   "FBS-Demo",
-    "timeout":  10000,
-    "portable": False,
-}
-```
+
 
 ### Execution Server
 ```python
