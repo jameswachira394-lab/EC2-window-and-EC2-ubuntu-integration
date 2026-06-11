@@ -6,19 +6,21 @@ on:
       - main
 
 jobs:
-  build:
+  # ── Job 1: Forex system → Ubuntu EC2 via Docker ──────────────────────────
+  build-forex:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.12"           # 3.14 doesn't exist yet
 
-      - run: pip install -r requirements.txt
+      - name: Install forex_system dependencies
+        run: pip install -r forex_system/requirements.txt
 
-      - run: python -m py_compile main.py
+      - name: Syntax check forex_system
+        run: python -m py_compile forex_system/main.py   # adjust entry point if needed
 
       - uses: docker/login-action@v3
         with:
@@ -27,6 +29,28 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./forex_system            # Dockerfile lives here
           push: true
-          tags: yourdockerhub/trading-system:latest
+          tags: ${{ secrets.DOCKER_USERNAME }}/forex-system:latest
+
+  # ── Job 2: MT5 executor → Windows (no Docker) ────────────────────────────
+  validate-mt5:
+    runs-on: windows-latest                  # MetaTrader 5 is Windows-only
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install mt5-executor dependencies
+        run: pip install -r mt5-executor/requirements.txt
+
+      - name: Syntax check mt5-executor
+        run: python -m py_compile mt5-executor/main.py   # adjust entry point if needed
+
+      - name: Upload mt5-executor artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-executor
+          path: mt5-executor/               # download & deploy manually to your Windows machine
