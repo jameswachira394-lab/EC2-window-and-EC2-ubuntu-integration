@@ -1,0 +1,733 @@
+# Institutional Forex Trading System — Full Documentation
+
+> **Version:** 2.0 (Stage 2 — EC2 Split Architecture)  
+> **Last Updated:** June 2026  
+> **Repository:** [EC2-window-and-EC2-ubuntu-integration](https://github.com/jameswachira394-lab/EC2-window-and-EC2-ubuntu-integration)
+
+---
+
+## Table of Contents
+
+1. [System Overview](#1-system-overview)
+2. [Architecture](#2-architecture)
+3. [Repository Structure](#3-repository-structure)
+4. [Component Reference](#4-component-reference)
+   - 4.1 [Ubuntu Trading Engine (`forex_system/`)](#41-ubuntu-trading-engine-forex_system)
+   - 4.2 [Windows MT5 Execution Server (`mt5-executor/`)](#42-windows-mt5-execution-server-mt5-executor)
+5. [Signal Pipeline — 13 Steps](#5-signal-pipeline--13-steps)
+6. [Configuration Reference](#6-configuration-reference)
+7. [API Reference (MT5 Execution Server)](#7-api-reference-mt5-execution-server)
+8. [Deployment Guide](#8-deployment-guide)
+   - 8.1 [Windows EC2 — MT5 Execution Server](#81-windows-ec2--mt5-execution-server)
+   - 8.2 [Ubuntu EC2 — Trading Engine (Docker)](#82-ubuntu-ec2--trading-engine-docker)
+9. [Running Locally (Development)](#9-running-locally-development)
+10. [CLI Reference](#10-cli-reference)
+11. [Risk Management](#11-risk-management)
+12. [Logging & Observability](#12-logging--observability)
+13. [News Filter](#13-news-filter)
+14. [Backtesting](#14-backtesting)
+15. [Security Notes](#15-security-notes)
+16. [Troubleshooting](#17-troubleshooting)
+
+---
+
+## 1. System Overview
+
+An **institutional-grade, automated Forex trading system** split across two AWS EC2 instances:
+
+| Layer | Machine | Role |
+|---|---|---|
+| **Signal Engine** | Ubuntu EC2 (Docker) | Market analysis, risk management, signal generation |
+| **Order Execution** | Windows EC2 | Connects to MetaTrader5 and places real trades |
+
+The Ubuntu container has **zero MetaTrader5 dependency**. It communicates with the Windows EC2 over HTTP using a lightweight REST API. This separation means:
+
+- The trading logic can be updated, redeployed, and scaled independently of the MT5 connection.
+- The Windows server is a thin, stable executor that changes infrequently.
+- The Ubuntu container is fully testable without MT5 installed (simulation mode).
+
+---
+
+## 2. Architecture
+
+```
+┌────────────────────────────────────────────────────────┐
+│                   Ubuntu EC2 (Docker)                  │
+│                                                        │
+│   ┌──────────────────────────────────────────────┐    │
+│   │              forex_system/                   │    │
+│   │                                              │    │
+│   │  main.py (TradingBot orchestrator)           │    │
+│   │    │                                         │    │
+│   │    ├── MT5Connector  ──► simulation OHLCV    │    │
+│   │    ├── SignalEngine  ──► 13-step pipeline    │    │
+│   │    ├── RiskManager  ──► drawdown / halts     │    │
+│   │    ├── SignalLogger  ──► CSV audit trail      │    │
+│   │    └── ExecutionClient ─────────────────┐    │    │
+│   └──────────────────────────────────────── │ ───┘    │
+│                                             │ HTTP     │
+└──────────────────────────────────────────── │ ────────┘
+                                              │ POST /buy
+                                              │ POST /sell
+                                              ▼
+┌────────────────────────────────────────────────────────┐
+│                  Windows EC2                           │
+│                                                        │
+│   ┌──────────────────────────────────────────────┐    │
+│   │              mt5-executor/                   │    │
+│   │                                              │    │
+│   │  main.py (FastAPI server :8000)              │    │
+│   │    ├── POST /buy   ──► mt5.order_send(BUY)  │    │
+│   │    ├── POST /sell  ──► mt5.order_send(SELL) │    │
+│   │    ├── GET /positions                        │    │
+│   │    └── GET /health                           │    │
+│   │                                              │    │
+│   │  mt5_connector.py ──► mt5.initialize()      │    │
+│   └──────────────────────────────────────────────┘    │
+│                          │                            │
+│              MetaTrader5 Python API                   │
+│                          │                            │
+│              MetaTrader5 Desktop App                  │
+│             (connected to broker server)              │
+└────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Summary
+
+```
+Every N seconds:
+  1. TradingBot._scan_all()
+  2. Load news events  ──► filter blackout window
+  3. RiskManager.can_trade() ──► check drawdown limits
+  4. For each symbol:
+       a. MT5Connector.get_ohlcv(H4, H1, M15)
+       b. SignalEngine.evaluate() ──► 13-step analysis
+       c. SignalLogger.log()      ──► append to CSV
+       d. If EXECUTE TRADE:
+            ExecutionClient.place_order()
+            └── POST http://windows-ec2:8000/buy (or /sell)
+                └── mt5.order_send() on Windows
+```
+
+---
+
+## 3. Repository Structure
+
+```
+forex_system/                      ← Git root
+│
+├── forex_system/                  ← Ubuntu trading engine
+│   ├── Dockerfile
+│   ├── requirements.txt           ← No MetaTrader5 dependency
+│   ├── main.py                    ← Bot orchestrator & CLI entry point
+│   │
+│   ├── config/
+│   │   └── settings.py            ← All tunable parameters
+│   │
+│   ├── connectors/
+│   │   ├── mt5_connector.py       ← OHLCV data (sim mode on Ubuntu)
+│   │   └── execution_client.py   ← HTTP client → Windows MT5 server
+│   │
+│   ├── core/
+│   │   ├── signal_engine.py      ← 13-step signal pipeline
+│   │   ├── indicators.py         ← EMA, ATR, volume, swing points
+│   │   └── risk_manager.py       ← Daily/weekly loss limits, streak guard
+│   │
+│   ├── utils/
+│   │   ├── news_filter.py        ← CSV news loader + blackout logic
+│   │   └── signal_logger.py      ← Append every signal to CSV
+│   │
+│   ├── signals/
+│   │   └── signal_log.csv        ← Auto-created signal audit trail
+│   │
+│   └── logs/
+│       └── trading_bot.log       ← Runtime log
+│
+└── mt5-executor/                  ← Windows MT5 server
+    ├── main.py                    ← FastAPI app with /buy /sell /health
+    ├── mt5_connector.py           ← MT5 initialize / connect wrapper
+    └── requirements.txt           ← fastapi uvicorn MetaTrader5 pydantic
+```
+
+---
+
+## 4. Component Reference
+
+### 4.1 Ubuntu Trading Engine (`forex_system/`)
+
+#### `main.py` — TradingBot
+
+The top-level orchestrator. Wires all components together and runs the main scan loop.
+
+| Class / Function | Purpose |
+|---|---|
+| `TradingBot.__init__()` | Creates `MT5Connector`, `ExecutionClient`, `SignalLogger` instances |
+| `TradingBot.start()` | Connects to MT5 data layer, initialises engine & risk manager, enters loop |
+| `TradingBot._run_loop()` | Infinite loop: scan → sleep → repeat |
+| `TradingBot._scan_all()` | Load news, check risk gate, iterate over all symbols |
+| `TradingBot._process_symbol()` | Fetch OHLCV → evaluate signal → log → execute |
+| `TradingBot._execute_signal()` | Check existing position → call `ExecutionClient.place_order()` |
+
+---
+
+#### `connectors/mt5_connector.py` — MT5Connector
+
+Handles **market data only** on Ubuntu (always runs in simulation mode since MT5 is not installed).
+
+| Method | Returns | Notes |
+|---|---|---|
+| `connect()` | `bool` | Returns `True` in sim mode |
+| `get_account_balance()` | `float` | Returns `10,000.0` in sim mode |
+| `get_ohlcv(symbol, tf, count)` | `DataFrame` | Synthetic OHLCV in sim mode |
+| `get_symbol_info(symbol)` | `dict` | Returns default pip/lot info in sim |
+| `get_tick(symbol)` | `dict` | Returns synthetic bid/ask in sim |
+
+> **Simulation OHLCV** is seeded by `hash(symbol + timeframe)` so results are deterministic and reproducible across runs.
+
+---
+
+#### `connectors/execution_client.py` — ExecutionClient
+
+Replaces all direct `mt5.order_send()` calls. Sends HTTP requests to the Windows MT5 server.
+
+| Method | HTTP call | Notes |
+|---|---|---|
+| `ping()` | `GET /health` | Returns `True` if server is up |
+| `place_order(...)` | `POST /buy` or `POST /sell` | Full order params; returns server response dict |
+| `get_open_positions(symbol)` | `GET /positions?symbol=...` | Returns `[]` on connection error (fail-safe) |
+
+**Environment variable:**
+```bash
+MT5_SERVER_URL=http://<windows-ec2-ip>:8000
+```
+Falls back to `http://localhost:8000` if not set.
+
+---
+
+#### `core/signal_engine.py` — SignalEngine
+
+Implements the full 13-step institutional signal pipeline. Returns a `TradeSignal` dataclass.
+
+**`TradeSignal` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `pair` | `str` | Currency pair, e.g. `EURUSD` |
+| `direction` | `str` | `LONG` / `SHORT` / `NO_TRADE` |
+| `confidence` | `int` | 0–100 weighted score |
+| `entry` | `float` | Suggested entry price |
+| `stop_loss` | `float` | Stop loss price |
+| `tp1/tp2/tp3` | `float` | Three take-profit levels |
+| `risk_reward` | `float` | Reward-to-risk ratio |
+| `lot_size` | `float` | Calculated lot size |
+| `decision` | `str` | `EXECUTE TRADE` / `REVIEW MANUALLY` / `NO TRADE` |
+| `rejection_log` | `list[str]` | Reasons why trade was skipped |
+
+**Confidence scoring weights:**
+
+| Check | Weight |
+|---|---|
+| H4 trend aligned | 20 |
+| H1 trend aligned | 15 |
+| Market structure | 15 |
+| Liquidity sweep | 15 |
+| Volume confirmation | 12 |
+| Breakout confirmed | 10 |
+| ATR compressed | 5 |
+| ATR expanding | 5 |
+| R:R ≥ minimum | 3 |
+| **Total** | **100** |
+
+**Decision thresholds:**
+
+| Confidence | Decision |
+|---|---|
+| ≥ 80 | `EXECUTE TRADE` |
+| 70–79 | `REVIEW MANUALLY` |
+| < 70 | `NO TRADE` |
+
+---
+
+#### `core/indicators.py` — Technical Indicators
+
+Pure pandas/numpy — no TA-Lib required.
+
+| Function | Description |
+|---|---|
+| `add_emas(df)` | Adds `ema20` and `ema50` columns |
+| `add_atr(df)` | Adds `atr` (14-period) and `atr_ma` (20-period MA) columns |
+| `add_volume_ratio(df)` | Adds `vol_ma` and `vol_ratio` (current/average) columns |
+| `get_swing_points(df)` | Adds `swing_high` and `swing_low` boolean columns |
+| `classify_trend(df)` | `bullish` if EMA20 > EMA50 and close > EMA50, else `bearish` or `neutral` |
+| `classify_market_structure(df)` | HH+HL → `bullish`; LH+LL → `bearish`; else `neutral` |
+| `detect_liquidity_sweep(df)` | Wick rejection after sweeping a swing high/low |
+| `detect_breakout(df)` | Close above/below 10-bar consolidation range and prior swing |
+| `is_atr_expanding(df)` | `True` if current ATR > previous ATR |
+| `is_atr_compressed(df)` | `True` if current ATR < 20-period ATR average |
+
+---
+
+#### `core/risk_manager.py` — RiskManager
+
+Persistent risk state is stored in `logs/risk_state.json` and reloaded on startup.
+
+| Guard | Setting | Default |
+|---|---|---|
+| Daily loss limit | `MAX_DAILY_LOSS_PCT` | 3% of initial balance |
+| Weekly loss limit | `MAX_WEEKLY_LOSS_PCT` | 6% of initial balance |
+| Consecutive losses | `MAX_CONSEC_LOSSES` | 3 |
+
+`RiskManager.can_trade(balance)` returns `(False, reason_string)` when any limit is breached.
+
+---
+
+#### `utils/news_filter.py` — News Filter
+
+Loads high-impact Forex news events from `config/news_events.csv`.
+
+**CSV format:**
+```
+datetime_utc,currency,impact,event
+2024-12-06 13:30:00,USD,HIGH,Non-Farm Payrolls
+2024-12-11 13:30:00,USD,HIGH,CPI m/m
+2024-12-18 19:00:00,USD,HIGH,FOMC Rate Decision
+```
+
+Only `impact=HIGH` rows are loaded. A 30-minute blackout window is enforced before and after each event (configurable via `NEWS_BLACKOUT_MINUTES`).
+
+---
+
+#### `utils/signal_logger.py` — SignalLogger
+
+Appends every evaluated signal to `signals/signal_log.csv`, including all indicator readings and rejection reasons — useful for backtesting and audit.
+
+---
+
+### 4.2 Windows MT5 Execution Server (`mt5-executor/`)
+
+#### `main.py` — FastAPI Server
+
+Runs on port `8000`. Receives trade commands from the Ubuntu engine.
+
+| Endpoint | Method | Body / Params | Description |
+|---|---|---|---|
+| `/health` | GET | — | MT5 connection status + balance |
+| `/buy` | POST | `Order` JSON | Place BUY market order |
+| `/sell` | POST | `Order` JSON | Place SELL market order |
+| `/positions` | GET | `?symbol=EURUSD` (optional) | List open positions |
+| `/docs` | GET | — | Swagger UI (auto-generated) |
+
+**Order payload schema:**
+```json
+{
+  "symbol":  "EURUSD",
+  "volume":  0.01,
+  "entry":   1.08500,
+  "sl":      1.08200,
+  "tp1":     1.08900,
+  "tp2":     1.09200,
+  "tp3":     1.09600,
+  "comment": "InstitutionalBot conf=85"
+}
+```
+
+#### `mt5_connector.py` — MT5 Initializer
+
+```python
+import MetaTrader5 as mt5
+
+def connect():
+    if not mt5.initialize():
+        raise Exception("MT5 initialization failed")
+    return True
+```
+
+Called once at server startup. MT5 desktop app must be open and logged into your broker account.
+
+---
+
+## 5. Signal Pipeline — 13 Steps
+
+| Step | Filter / Check | Pass Condition |
+|---|---|---|
+| 1 | **H4 / H1 Trend bias** | H4 and H1 EMA trend must agree (both bullish or both bearish) |
+| 2 | **Market Structure** | H1 swing structure (HH/HL or LH/LL) must match the trend bias |
+| 3 | **Liquidity Sweep** | M15 must show wick rejection after sweeping a prior swing point |
+| 4 | **ATR Compression** | Current ATR < 20-period ATR average (energy buildup) |
+| 5 | **Volume Confirmation** | Last M15 candle volume ≥ 1.5× the 20-period average |
+| 6 | **Breakout Confirmation** | M15 close outside 10-bar consolidation range + above/below prior swing |
+| 7 | *(ATR Expansion)* | ATR expanding (bonus score, not hard gate) |
+| 8 | **Entry / SL / TP** | Entry at current close; SL below sweep price; TP1/2 at 2×/3× ATR |
+| 9 | **Lot Size** | Risk-based: `risk_amount / (pips_at_risk × pip_value)` |
+| 10 | **Session Filter** | UTC hour must be within London/NY window (07:00–21:00 UTC) |
+| 11 | **News Blackout** | No high-impact event within ±30 minutes |
+| 12 | **Confidence Score** | Weighted sum of all checks ≥ `MIN_CONFIDENCE` (default 70) |
+| 13 | **Decision** | ≥80 → Execute; 70–79 → Review; <70 → No Trade |
+
+---
+
+## 6. Configuration Reference
+
+All settings are in [`forex_system/config/settings.py`](forex_system/config/settings.py).
+
+### MT5 Connection (Windows server only)
+```python
+MT5_CONFIG = {
+    "login":    10401216,
+    "password": "...",
+    "server":   "FBS-Demo",
+    "timeout":  10000,
+    "portable": False,
+}
+```
+
+### Execution Server
+```python
+# Set via environment variable on Ubuntu EC2:
+# export MT5_SERVER_URL=http://<windows-ec2-private-ip>:8000
+MT5_SERVER_URL = os.environ.get("MT5_SERVER_URL", "http://localhost:8000")
+```
+
+### Tradeable Symbols
+```python
+SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF",
+           "AUDUSD", "NZDUSD", "USDCAD", "GBPJPY", "EURJPY"]
+```
+
+### Risk Parameters
+| Setting | Default | Description |
+|---|---|---|
+| `RISK_PER_TRADE_PCT` | `1.0` | % of balance risked per trade |
+| `MAX_DAILY_LOSS_PCT` | `3.0` | Max daily loss as % of initial balance |
+| `MAX_WEEKLY_LOSS_PCT` | `6.0` | Max weekly loss as % of initial balance |
+| `MAX_CONSEC_LOSSES` | `3` | Max consecutive losing trades before halt |
+
+### Signal Parameters
+| Setting | Default | Description |
+|---|---|---|
+| `EMA_FAST` | `20` | Fast EMA period |
+| `EMA_SLOW` | `50` | Slow EMA period |
+| `ATR_PERIOD` | `14` | ATR calculation period |
+| `ATR_MA_PERIOD` | `20` | Period for ATR average (compression check) |
+| `VOLUME_MA_PERIOD` | `20` | Period for volume average |
+| `VOLUME_RATIO_MIN` | `1.5` | Minimum volume ratio for confirmation |
+| `MIN_RR` | `2.0` | Minimum risk-reward ratio |
+| `TP1_ATR_MULT` | `2.0` | TP1 = entry ± ATR × 2.0 |
+| `TP2_ATR_MULT` | `3.0` | TP2 = entry ± ATR × 3.0 |
+| `MIN_CONFIDENCE` | `70` | Minimum score to generate a trade signal |
+| `SWING_LOOKBACK` | `10` | Bars each side for swing point detection |
+| `CANDLES_HISTORY` | `300` | Number of candles fetched per timeframe |
+
+### Session Windows (UTC)
+| Session | Hours |
+|---|---|
+| London | 07:00–16:00 |
+| New York | 12:00–21:00 |
+| London/NY Overlap | 12:00–16:00 |
+| **Active trading** | **07:00–21:00 UTC** |
+
+---
+
+## 7. API Reference (MT5 Execution Server)
+
+Base URL: `http://<windows-ec2-ip>:8000`
+
+### `GET /health`
+```json
+{
+  "status": "ok",
+  "mt5_connected": true,
+  "balance": 10000.0
+}
+```
+
+### `POST /buy` and `POST /sell`
+
+**Request body:**
+```json
+{
+  "symbol":  "EURUSD",
+  "volume":  0.01,
+  "sl":      1.08200,
+  "tp1":     1.08900,
+  "comment": "InstitutionalBot conf=85"
+}
+```
+
+**Response:**
+```json
+{
+  "status":  "FILLED",
+  "retcode": 10009,
+  "order":   12345678,
+  "volume":  0.01,
+  "price":   1.08500,
+  "comment": ""
+}
+```
+
+| `retcode` | Meaning |
+|---|---|
+| `10009` | `TRADE_RETCODE_DONE` — success |
+| Any other | Order failed — check `comment` field |
+
+### `GET /positions`
+```json
+{
+  "positions": [
+    {
+      "ticket": 12345678,
+      "symbol": "EURUSD",
+      "volume": 0.01,
+      "type":   "BUY",
+      "profit": 12.50,
+      "sl":     1.08200,
+      "tp":     1.08900
+    }
+  ]
+}
+```
+
+### Swagger UI
+Open `http://<windows-ec2-ip>:8000/docs` in a browser to see interactive API docs and test endpoints.
+
+---
+
+## 8. Deployment Guide
+
+### 8.1 Windows EC2 — MT5 Execution Server
+
+**Prerequisites:**
+- MetaTrader5 desktop app installed and logged in to your broker
+- Python 3.10+ installed
+- Port `8000` open in AWS Security Group inbound rules
+
+**Steps:**
+
+```powershell
+# 1. Clone the repo
+git clone https://github.com/jameswachira394-lab/EC2-window-and-EC2-ubuntu-integration.git
+cd EC2-window-and-EC2-ubuntu-integration\mt5-executor
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Start the server
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+# 4. Verify
+# Open browser: http://localhost:8000/docs
+```
+
+**Run as a background service (recommended):**
+```powershell
+# Using NSSM (Non-Sucking Service Manager)
+nssm install MT5Executor python -m uvicorn main:app --host 0.0.0.0 --port 8000
+nssm set MT5Executor AppDirectory C:\path\to\mt5-executor
+nssm start MT5Executor
+```
+
+---
+
+### 8.2 Ubuntu EC2 — Trading Engine (Docker)
+
+**Prerequisites:**
+- Docker installed
+- Port `8000` reachable to the Windows EC2 (Security Group / VPC rules)
+
+**Steps:**
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/jameswachira394-lab/EC2-window-and-EC2-ubuntu-integration.git
+cd EC2-window-and-EC2-ubuntu-integration/forex_system
+
+# 2. Build the Docker image
+docker build -t forex-bot .
+
+# 3. Run with the Windows EC2 IP injected
+docker run -d \
+  --name forex-bot \
+  --restart unless-stopped \
+  -e MT5_SERVER_URL=http://<windows-ec2-private-ip>:8000 \
+  -v $(pwd)/logs:/forex_system/logs \
+  -v $(pwd)/signals:/forex_system/signals \
+  forex-bot
+
+# 4. Follow logs
+docker logs -f forex-bot
+```
+
+**Environment variables:**
+
+| Variable | Required | Example | Description |
+|---|---|---|---|
+| `MT5_SERVER_URL` | ✅ | `http://10.0.1.50:8000` | Windows EC2 execution server URL |
+
+> **Tip:** Use the **private IP** of the Windows EC2 if both instances are in the same AWS VPC — faster and no egress charges.
+
+---
+
+## 9. Running Locally (Development)
+
+```bash
+cd forex_system
+
+# Install dependencies (no MT5 needed — sim mode)
+pip install -r requirements.txt
+
+# Run in dry-run simulation (no orders placed, no MT5 server needed)
+python main.py --dry-run --scan-once
+
+# Scan a single pair
+python main.py --dry-run --symbol EURUSD --scan-once
+
+# Live loop (calls Windows MT5 server for execution)
+MT5_SERVER_URL=http://localhost:8000 python main.py
+```
+
+---
+
+## 10. CLI Reference
+
+```
+python main.py [OPTIONS]
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--scan-once` | flag | off | Run one scan then exit |
+| `--dry-run` | flag | off | Generate signals but never execute |
+| `--symbol EURUSD` | string | all | Scan a single symbol only |
+| `--interval 60` | int | 60 | Seconds between scans |
+
+**Examples:**
+```bash
+# Single scan, all pairs, dry run
+python main.py --scan-once --dry-run
+
+# Live trading, scan every 5 minutes
+python main.py --interval 300
+
+# Debug one pair
+python main.py --symbol GBPUSD --scan-once --dry-run
+```
+
+---
+
+## 11. Risk Management
+
+The `RiskManager` enforces three independent circuit-breakers. State is persisted to `logs/risk_state.json` so limits survive restarts.
+
+### Daily Loss Limit
+- If `(initial_balance - current_balance) / initial_balance ≥ MAX_DAILY_LOSS_PCT`, trading halts for the day.
+
+### Weekly Loss Limit
+- Same calculation but tracked over the ISO calendar week.
+
+### Consecutive Loss Streak
+- A counter increments on each losing trade and resets on a winner.
+- Trading halts when `consecutive_losses ≥ MAX_CONSEC_LOSSES`.
+
+### Lot Size Calculation
+```
+risk_amount  = balance × RISK_PER_TRADE_PCT / 100
+pips_at_risk = |entry - stop_loss| / pip_size
+lot_size     = risk_amount / (pips_at_risk × pip_value)
+```
+Result is clamped to a minimum of `0.01` lots.
+
+---
+
+## 12. Logging & Observability
+
+### Runtime Log — `logs/trading_bot.log`
+All INFO/WARNING/ERROR messages. Rotates with standard Python logging.
+
+### Signal Audit CSV — `signals/signal_log.csv`
+Every evaluated signal (including NO_TRADE) is appended. Columns:
+
+```
+timestamp, pair, direction, confidence, decision,
+entry, stop_loss, tp1, tp2, tp3, risk_reward, lot_size,
+trend_h4, trend_h1, trend_m15, structure,
+volume_ratio, atr_current, atr_expanding, atr_compressed,
+sweep_detected, sweep_direction, sweep_rejection,
+breakout_confirmed, breakout_direction,
+rejection_reasons
+```
+
+Use this CSV to analyse signal quality, filter rates, and edge over time.
+
+---
+
+## 13. News Filter
+
+### Adding News Events
+
+Create or update `config/news_events.csv`:
+
+```csv
+datetime_utc,currency,impact,event
+2024-12-06 13:30:00,USD,HIGH,Non-Farm Payrolls
+2024-12-11 13:30:00,USD,HIGH,CPI m/m
+2024-12-18 19:00:00,USD,HIGH,FOMC Rate Decision
+2024-12-12 13:15:00,EUR,HIGH,ECB Rate Decision
+2024-12-19 12:00:00,GBP,HIGH,BOE Rate Decision
+```
+
+Only rows with `impact=HIGH` are loaded. The filter blocks trading for `±NEWS_BLACKOUT_MINUTES` (default 30) around each event.
+
+### Generating a Sample CSV
+```bash
+python -c "from utils.news_filter import create_sample_news_csv; create_sample_news_csv()"
+```
+
+---
+
+## 14. Backtesting
+
+```bash
+python backtest.py
+```
+
+`backtest.py` runs the `SignalEngine` against historical OHLCV data stored in simulation mode. Outputs a performance summary and saves results to `signals/backtest_results.csv`.
+
+---
+
+## 15. Security Notes
+
+> [!CAUTION]
+> The `config/settings.py` file contains MT5 login credentials. **Never commit real credentials to a public repository.** Use environment variables or AWS Secrets Manager in production.
+
+**Recommended approach:**
+```python
+# settings.py
+import os
+MT5_CONFIG = {
+    "login":    int(os.environ["MT5_LOGIN"]),
+    "password": os.environ["MT5_PASSWORD"],
+    "server":   os.environ["MT5_SERVER"],
+    ...
+}
+```
+
+**Network security:**
+- Keep port `8000` (MT5 server) **NOT publicly accessible**. Only allow the Ubuntu EC2's private IP.
+- Use **AWS VPC Security Groups** to restrict inbound rules on the Windows EC2 to the Ubuntu EC2's private IP only.
+- Consider adding an API key header to the FastAPI server for additional auth.
+
+---
+
+## 16. Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| `MT5 initialization failed` | MT5 desktop app not running | Open and log into MT5 on Windows EC2 |
+| `ExecutionClient: MT5 server unreachable` | Wrong IP / port blocked | Check `MT5_SERVER_URL` env var and AWS Security Group |
+| `Volume ratio 0.00 < 1.5` | No volume data in sim mode | Expected in simulation — real data from MT5 |
+| `Trend conflict H4=neutral` | Choppy market conditions | Normal — bot skips low-quality setups |
+| `Outside allowed sessions` | Running outside 07:00–21:00 UTC | Expected — bot only trades London/NY sessions |
+| `Order failed: retcode=10014` | Invalid lot size | Check `volume_min`/`volume_step` for the symbol in MT5 |
+| `Order failed: retcode=10006` | MT5 not connected to broker | Re-login to MT5 or check internet on Windows EC2 |
+| Docker container exits immediately | Missing `MT5_SERVER_URL` or bad Python path | Check `docker logs forex-bot` |
