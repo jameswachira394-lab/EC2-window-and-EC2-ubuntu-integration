@@ -1,0 +1,215 @@
+"""
+Institutional Forex Trading Bot
+────────────────────────────────
+Main orchestrator — connects to MT5, scans all symbols every scan_interval
+seconds, generates signals, enforces risk rules, and executes orders.
+
+Run:
+    python main.py                  # live / sim mode
+    python main.py --scan-once      # single scan then exit
+    python main.py --symbol EURUSD  # scan one pair only
+"""
+
+from __future__ import annotations
+import argparse
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── ensure project root is importable ────────────────────────────
+sys.path.insert(0, str(Path(__file__).parent))
+
+from config.settings import (
+    SYMBOLS, TIMEFRAMES, RISK_PER_TRADE_PCT, LOG_DIR,
+)
+from connectors.mt5_connector import MT5Connector
+from core.signal_engine import SignalEngine, format_signal
+from core.risk_manager import RiskManager
+from utils.signal_logger import SignalLogger
+from utils.news_filter import load_news_events
+
+# ── Logging setup ─────────────────────────────────────────────────
+Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(f"{LOG_DIR}/trading_bot.log"),
+    ],
+)
+logger = logging.getLogger("TradingBot")
+
+
+# ─── Bot Class ────────────────────────────────────────────────────
+
+class TradingBot:
+
+    def __init__(
+        self,
+        scan_interval: int   = 60,    # seconds between scans
+        dry_run:       bool  = False,  # True = log signals but never execute
+        symbols:       list  = None,
+    ):
+        self.scan_interval = scan_interval
+        self.dry_run       = dry_run
+        self.symbols       = symbols or SYMBOLS
+
+        self.mt5    = MT5Connector()
+        self.logger = SignalLogger()
+
+        # Placeholders — initialized after MT5 connects
+        self.engine  = None
+        self.risk_mgr = None
+
+    # ── Lifecycle ──────────────────────────────────────────────────
+
+    def start(self, scan_once: bool = False):
+        logger.info("=" * 60)
+        logger.info("Institutional Forex Trading Bot Starting")
+        logger.info("Dry-run: %s | Symbols: %s", self.dry_run, self.symbols)
+        logger.info("=" * 60)
+
+        if not self.mt5.connect():
+            logger.error("Failed to connect to MT5. Exiting.")
+            sys.exit(1)
+
+        balance = self.mt5.get_account_balance()
+        logger.info("Account balance: %.2f", balance)
+
+        self.engine   = SignalEngine(account_balance=balance, risk_pct=RISK_PER_TRADE_PCT)
+        self.risk_mgr = RiskManager(initial_balance=balance)
+
+        try:
+            if scan_once:
+                self._scan_all()
+            else:
+                self._run_loop()
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user.")
+        finally:
+            self.mt5.disconnect()
+            logger.info("Bot stopped.")
+
+    def _run_loop(self):
+        logger.info("Entering main scan loop (interval=%ds). Press Ctrl+C to stop.", self.scan_interval)
+        while True:
+            self._scan_all()
+            logger.info("Scan complete. Sleeping %ds...", self.scan_interval)
+            time.sleep(self.scan_interval)
+
+    # ── Core Scan ─────────────────────────────────────────────────
+
+    def _scan_all(self):
+        utc_now     = datetime.now(timezone.utc).replace(tzinfo=None)
+        news_events = load_news_events()
+        balance     = self.mt5.get_account_balance()
+
+        # Update engine with latest balance
+        self.engine.balance = balance
+
+        # Risk gate
+        ok, reason = self.risk_mgr.can_trade(balance)
+        if not ok:
+            logger.warning("TRADING HALTED: %s", reason)
+            return
+
+        for symbol in self.symbols:
+            try:
+                self._process_symbol(symbol, utc_now, news_events)
+            except Exception as e:
+                logger.exception("Error processing %s: %s", symbol, e)
+
+    def _process_symbol(
+        self,
+        symbol:      str,
+        utc_now:     datetime,
+        news_events: list,
+    ):
+        # ── Fetch OHLCV ──────────────────────────────────────────
+        df_h4  = self.mt5.get_ohlcv(symbol, "H4")
+        df_h1  = self.mt5.get_ohlcv(symbol, "H1")
+        df_m15 = self.mt5.get_ohlcv(symbol, "M15")
+
+        if df_h4 is None or df_h1 is None or df_m15 is None:
+            logger.warning("Skipping %s — missing data.", symbol)
+            return
+
+        # ── Generate signal ───────────────────────────────────────
+        signal = self.engine.evaluate(
+            symbol     = symbol,
+            df_h4      = df_h4,
+            df_h1      = df_h1,
+            df_m15     = df_m15,
+            news_times = news_events,
+            utc_now    = utc_now,
+        )
+
+        # ── Log signal ────────────────────────────────────────────
+        self.logger.log(signal)
+
+        # ── Print formatted output ────────────────────────────────
+        print("\n" + format_signal(signal))
+
+        # ── Execute if warranted ──────────────────────────────────
+        if signal.decision in ("EXECUTE TRADE",) and signal.direction != "NO_TRADE":
+            self._execute_signal(signal)
+
+    def _execute_signal(self, signal):
+        if self.dry_run:
+            logger.info("[DRY RUN] Would execute: %s %s conf=%d",
+                        signal.pair, signal.direction, signal.confidence)
+            return
+
+        # Check for existing position
+        existing = self.mt5.get_open_positions(symbol=signal.pair)
+        if existing:
+            logger.info("Skipping %s — position already open.", signal.pair)
+            return
+
+        direction_str = "BUY" if signal.direction == "LONG" else "SELL"
+
+        result = self.mt5.place_order(
+            symbol    = signal.pair,
+            direction = direction_str,
+            lot_size  = signal.lot_size,
+            entry     = signal.entry,
+            sl        = signal.stop_loss,
+            tp1       = signal.tp1,
+            tp2       = signal.tp2,
+            tp3       = signal.tp3,
+            comment   = f"InstitutionalBot conf={signal.confidence}",
+        )
+
+        logger.info("Order result: %s", result)
+
+
+# ─── CLI Entry Point ──────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Institutional Forex Trading Bot")
+    parser.add_argument("--scan-once",  action="store_true",
+                        help="Run one scan then exit")
+    parser.add_argument("--dry-run",    action="store_true",
+                        help="Generate signals but do not place orders")
+    parser.add_argument("--symbol",     type=str, default=None,
+                        help="Scan a single symbol only (e.g. EURUSD)")
+    parser.add_argument("--interval",   type=int, default=60,
+                        help="Scan interval in seconds (default 60)")
+    args = parser.parse_args()
+
+    symbols = [args.symbol.upper()] if args.symbol else None
+
+    bot = TradingBot(
+        scan_interval = args.interval,
+        dry_run       = args.dry_run,
+        symbols       = symbols,
+    )
+    bot.start(scan_once=args.scan_once)
+
+
+if __name__ == "__main__":
+    main()

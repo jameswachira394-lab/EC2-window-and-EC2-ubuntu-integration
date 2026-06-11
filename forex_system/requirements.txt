@@ -1,0 +1,16 @@
+# Institutional Forex Trading System — Requirements
+# Install with: pip install -r requirements.txt
+
+# Core data & math
+pandas>=2.0.0
+numpy>=1.24.0
+
+# MetaTrader 5 connector (Windows only — requires MT5 desktop app installed)
+# Uncomment when running on Windows with MT5
+# MetaTrader5>=5.0.37
+
+# Optional: faster EMA / ATR (drop-in replacement, not required)
+# pandas-ta>=0.3.14b
+
+# Utilities
+python-dateutil>=2.8.2

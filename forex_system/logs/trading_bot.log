@@ -1,0 +1,9 @@
+2026-06-11 09:43:41,978 [INFO] TradingBot — ============================================================
+2026-06-11 09:43:41,979 [INFO] TradingBot — Institutional Forex Trading Bot Starting
+2026-06-11 09:43:41,979 [INFO] TradingBot — Dry-run: True | Symbols: ['EURUSD']
+2026-06-11 09:43:41,979 [INFO] TradingBot — ============================================================
+2026-06-11 09:43:41,979 [WARNING] connectors.mt5_connector — MT5 not installed — simulation mode active.
+2026-06-11 09:43:41,979 [INFO] TradingBot — Account balance: 10000.00
+2026-06-11 09:43:41,980 [INFO] utils.news_filter — No news CSV found at config/news_events.csv — using empty news list.
+2026-06-11 09:43:42,011 [INFO] connectors.mt5_connector — MT5 disconnected.
+2026-06-11 09:43:42,011 [INFO] TradingBot — Bot stopped.
