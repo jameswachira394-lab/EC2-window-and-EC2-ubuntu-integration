@@ -1,4 +1,11 @@
-fastapi
-uvicorn
-MetaTrader5
-pydantic
+# MT5 Execution Server — Requirements (Windows EC2 only)
+# MetaTrader5 is a Windows-only package. This server CANNOT run in Linux/Docker.
+#
+# Install:
+#   pip install -r requirements.txt
+
+fastapi>=0.100.0
+uvicorn>=0.23.0
+MetaTrader5>=5.0.37
+pydantic>=2.0.0
+python-dotenv>=1.0.0
