@@ -1,16 +1,16 @@
-# Institutional Forex Trading System — Requirements
+# Institutional Forex Trading System — Requirements (Ubuntu / Docker)
 # Install with: pip install -r requirements.txt
+#
+# NOTE: MetaTrader5 is intentionally NOT listed here.
+#       Order execution is delegated to the Windows MT5 Execution Server
+#       via HTTP (see connectors/execution_client.py).
 
 # Core data & math
 pandas>=2.0.0
 numpy>=1.24.0
 
-# MetaTrader 5 connector (Windows only — requires MT5 desktop app installed)
-# Uncomment when running on Windows with MT5
-# MetaTrader5>=5.0.37
-
-# Optional: faster EMA / ATR (drop-in replacement, not required)
-# pandas-ta>=0.3.14b
+# HTTP client — talks to the Windows MT5 Execution Server
+requests>=2.31.0
 
 # Utilities
 python-dateutil>=2.8.2

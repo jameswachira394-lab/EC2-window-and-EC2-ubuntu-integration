@@ -1,13 +1,17 @@
 """
 Institutional Forex Trading Bot
 ────────────────────────────────
-Main orchestrator — connects to MT5, scans all symbols every scan_interval
-seconds, generates signals, enforces risk rules, and executes orders.
+Main orchestrator — fetches market data from MT5Connector (simulation on
+Ubuntu), generates signals, enforces risk rules, and delegates ALL order
+execution to the Windows MT5 Execution Server via HTTP (ExecutionClient).
 
 Run:
     python main.py                  # live / sim mode
     python main.py --scan-once      # single scan then exit
     python main.py --symbol EURUSD  # scan one pair only
+
+Environment variable required on Ubuntu EC2:
+    MT5_SERVER_URL=http://<windows-ec2-ip>:8000
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from config.settings import (
     SYMBOLS, TIMEFRAMES, RISK_PER_TRADE_PCT, LOG_DIR,
 )
 from connectors.mt5_connector import MT5Connector
+from connectors.execution_client import ExecutionClient
 from core.signal_engine import SignalEngine, format_signal
 from core.risk_manager import RiskManager
 from utils.signal_logger import SignalLogger
@@ -58,11 +63,14 @@ class TradingBot:
         self.dry_run       = dry_run
         self.symbols       = symbols or SYMBOLS
 
-        self.mt5    = MT5Connector()
-        self.logger = SignalLogger()
+        # Data layer  — runs in simulation mode on Ubuntu (no MT5 installed)
+        self.mt5       = MT5Connector()
+        # Execution layer — HTTP client → Windows MT5 server
+        self.executor  = ExecutionClient()
+        self.logger    = SignalLogger()
 
         # Placeholders — initialized after MT5 connects
-        self.engine  = None
+        self.engine   = None
         self.risk_mgr = None
 
     # ── Lifecycle ──────────────────────────────────────────────────
@@ -164,15 +172,16 @@ class TradingBot:
                         signal.pair, signal.direction, signal.confidence)
             return
 
-        # Check for existing position
-        existing = self.mt5.get_open_positions(symbol=signal.pair)
+        # Check for existing position via the Windows MT5 server
+        existing = self.executor.get_open_positions(symbol=signal.pair)
         if existing:
             logger.info("Skipping %s — position already open.", signal.pair)
             return
 
         direction_str = "BUY" if signal.direction == "LONG" else "SELL"
 
-        result = self.mt5.place_order(
+        # ── Delegate execution to the Windows MT5 server via HTTP ──
+        result = self.executor.place_order(
             symbol    = signal.pair,
             direction = direction_str,
             lot_size  = signal.lot_size,

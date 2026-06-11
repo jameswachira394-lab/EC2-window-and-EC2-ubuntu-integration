@@ -11,6 +11,15 @@ MT5_CONFIG = {
     "portable": False,
 }
 
+# ─── MT5 Execution Server (Windows EC2) ───────────────────────────
+# Override with env var on Ubuntu EC2:
+#   export MT5_SERVER_URL=http://<windows-ec2-private-ip>:8000
+import os
+MT5_SERVER_URL = os.environ.get(
+    "MT5_SERVER_URL",
+    "http://localhost:8000",   # default (same machine / dev)
+)
+
 # ─── Tradeable Pairs ───────────────────────────────────────────────
 SYMBOLS = [
     "EURUSD", "GBPUSD", "USDJPY",
