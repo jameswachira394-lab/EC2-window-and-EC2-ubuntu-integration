@@ -24,9 +24,25 @@ resource "aws_instance" "ubuntu" {
   }
 }
 
+data "aws_ami" "windows" {
+  most_recent = true
+
+  owners = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["Windows_Server-2022-English-Full-Base-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
 # ---------------- Windows EC2 ----------------
 resource "aws_instance" "windows" {
-  ami           = "ami-0b2f6494ff0b07a0e"
+  ami           = data.aws_ami.windows.id
   instance_type = var.instance_type
 
   subnet_id              = aws_subnet.public.id
