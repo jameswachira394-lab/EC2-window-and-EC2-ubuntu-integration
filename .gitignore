@@ -23,3 +23,4 @@ signals/backtest_results.csv
 
 # MT5 executor pycache
 mt5-executor/__pycache__/
+.terraform/
