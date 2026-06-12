@@ -44,7 +44,7 @@ The Ubuntu container has **zero MetaTrader5 dependency**. It communicates with t
 
 - The trading logic can be updated, redeployed, and scaled independently of the MT5 connection.
 - The Windows server is a thin, stable executor that changes infrequently.
-- The Ubuntu container is fully testable without MT5 installed (simulation mode).
+- The Ubuntu container operates without MT5 installed by fetching real market data over HTTP from the Windows server.
 
 ---
 
@@ -59,7 +59,7 @@ The Ubuntu container has **zero MetaTrader5 dependency**. It communicates with t
 │   │                                              │    │
 │   │  main.py (TradingBot orchestrator)           │    │
 │   │    │                                         │    │
-│   │    ├── MT5Connector  ──► simulation OHLCV    │    │
+│   │    ├── MT5Connector  ──► HTTP OHLCV & Ticks      │    │
 │   │    ├── SignalEngine  ──► 13-step pipeline    │    │
 │   │    ├── RiskManager  ──► drawdown / halts     │    │
 │   │    ├── SignalLogger  ──► CSV audit trail      │    │
@@ -79,6 +79,9 @@ The Ubuntu container has **zero MetaTrader5 dependency**. It communicates with t
 │   │  main.py (FastAPI server :8000)              │    │
 │   │    ├── POST /buy   ──► mt5.order_send(BUY)  │    │
 │   │    ├── POST /sell  ──► mt5.order_send(SELL) │    │
+│   │    ├── GET /ohlcv                            │    │
+│   │    ├── GET /tick                             │    │
+│   │    ├── GET /symbol_info                      │    │
 │   │    ├── GET /positions                        │    │
 │   │    └── GET /health                           │    │
 │   │                                              │    │
@@ -125,7 +128,7 @@ forex_system/                      ← Git root
 │   │   └── settings.py            ← All tunable parameters
 │   │
 │   ├── connectors/
-│   │   ├── mt5_connector.py       ← OHLCV data (sim mode on Ubuntu)
+│   │   ├── mt5_connector.py       ← OHLCV & Ticks (HTTP fallback)
 │   │   └── execution_client.py   ← HTTP client → Windows MT5 server
 │   │
 │   ├── core/
@@ -172,17 +175,17 @@ The top-level orchestrator. Wires all components together and runs the main scan
 
 #### `connectors/mt5_connector.py` — MT5Connector
 
-Handles **market data only** on Ubuntu (always runs in simulation mode since MT5 is not installed).
+Handles **market data** on Ubuntu. If MetaTrader5 is not installed (e.g., on Ubuntu), it automatically switches to `HTTP Mode` and fetches data from the Windows MT5 server instead of using local simulation.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `connect()` | `bool` | Returns `True` in sim mode |
-| `get_account_balance()` | `float` | Returns `10,000.0` in sim mode |
-| `get_ohlcv(symbol, tf, count)` | `DataFrame` | Synthetic OHLCV in sim mode |
-| `get_symbol_info(symbol)` | `dict` | Returns default pip/lot info in sim |
-| `get_tick(symbol)` | `dict` | Returns synthetic bid/ask in sim |
+| `connect()` | `bool` | Checks `/health` endpoint in HTTP mode |
+| `get_account_balance()` | `float` | Fetched via `/health` endpoint |
+| `get_ohlcv(symbol, tf, count)` | `DataFrame` | Fetched via `/ohlcv` endpoint |
+| `get_symbol_info(symbol)` | `dict` | Fetched via `/symbol_info` endpoint |
+| `get_tick(symbol)` | `dict` | Fetched via `/tick` endpoint |
 
-> **Simulation OHLCV** is seeded by `hash(symbol + timeframe)` so results are deterministic and reproducible across runs.
+> **HTTP Data Fetching:** Requires `MT5_SERVER_URL` to be correctly configured so it can route requests to the Windows EC2.
 
 ---
 

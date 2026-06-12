@@ -1,0 +1,81 @@
+name: Terraform CI/CD Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+
+  push:
+    branches:
+      - main
+
+env:
+  TF_VERSION: 1.6.6
+  AWS_REGION: us-east-1
+
+jobs:
+  terraform:
+    name: Terraform Pipeline
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: environments/dev
+
+    steps:
+      # ---------------------------
+      # Checkout code
+      # ---------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ---------------------------
+      # Setup Terraform
+      # ---------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # ---------------------------
+      # AWS Credentials
+      # (Use GitHub Secrets)
+      # ---------------------------
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ---------------------------
+      # Terraform Format Check
+      # ---------------------------
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      # ---------------------------
+      # Terraform Init
+      # ---------------------------
+      - name: Terraform Init
+        run: terraform init
+
+      # ---------------------------
+      # Terraform Validate
+      # ---------------------------
+      - name: Terraform Validate
+        run: terraform validate
+
+      # ---------------------------
+      # Terraform Plan (PR only)
+      # ---------------------------
+      - name: Terraform Plan
+        if: github.event_name == 'pull_request'
+        run: terraform plan -no-color
+
+      # ---------------------------
+      # Terraform Apply (main only)
+      # ---------------------------
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve

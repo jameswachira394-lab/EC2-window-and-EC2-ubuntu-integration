@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Optional
+import requests
 
 import pandas as pd
 
@@ -17,9 +18,9 @@ try:
     MT5_AVAILABLE = True
 except ImportError:
     MT5_AVAILABLE = False
-    print("[WARNING] MetaTrader5 package not installed. Running in SIMULATION mode.")
+    print("[INFO] MetaTrader5 not installed. Operating via HTTP Execution Server.")
 
-from config.settings import MT5_CONFIG, CANDLES_HISTORY
+from config.settings import MT5_CONFIG, CANDLES_HISTORY, MT5_SERVER_URL
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +58,25 @@ class MT5Connector:
 
     def __init__(self):
         self.connected = False
-        self._sim_mode = not MT5_AVAILABLE
+        self._http_mode = not MT5_AVAILABLE
 
     # ── Connection ─────────────────────────────────────────────────
 
     def connect(self) -> bool:
-        if self._sim_mode:
-            logger.warning("MT5 not installed — simulation mode active.")
-            self.connected = True
-            return True
+        if self._http_mode:
+            logger.info("Connecting via HTTP to MT5 server: %s", MT5_SERVER_URL)
+            try:
+                r = requests.get(f"{MT5_SERVER_URL}/health", timeout=10)
+                if r.status_code == 200 and r.json().get("mt5_connected"):
+                    logger.info("HTTP MT5 server connected successfully.")
+                    self.connected = True
+                    return True
+                else:
+                    logger.error("HTTP MT5 server responded, but MT5 is not connected on the Windows side.")
+                    return False
+            except Exception as e:
+                logger.error("Failed to connect to HTTP MT5 server: %s", e)
+                return False
 
         if not mt5.initialize(
             login=MT5_CONFIG["login"],
@@ -91,7 +102,7 @@ class MT5Connector:
         return True
 
     def disconnect(self):
-        if not self._sim_mode and MT5_AVAILABLE:
+        if not self._http_mode and MT5_AVAILABLE:
             mt5.shutdown()
         self.connected = False
         logger.info("MT5 disconnected.")
@@ -99,14 +110,28 @@ class MT5Connector:
     # ── Account Info ───────────────────────────────────────────────
 
     def get_account_balance(self) -> float:
-        if self._sim_mode:
-            return 10_000.0
+        if self._http_mode:
+            try:
+                r = requests.get(f"{MT5_SERVER_URL}/health", timeout=10)
+                if r.status_code == 200:
+                    return float(r.json().get("balance", 0.0))
+            except Exception as e:
+                logger.error("Failed to fetch balance via HTTP: %s", e)
+            return 0.0
+            
         info = mt5.account_info()
         return info.balance if info else 0.0
 
     def get_account_equity(self) -> float:
-        if self._sim_mode:
-            return 10_000.0
+        if self._http_mode:
+            try:
+                r = requests.get(f"{MT5_SERVER_URL}/health", timeout=10)
+                if r.status_code == 200:
+                    return float(r.json().get("equity", 0.0))
+            except Exception as e:
+                logger.error("Failed to fetch equity via HTTP: %s", e)
+            return 0.0
+            
         info = mt5.account_info()
         return info.equity if info else 0.0
 
@@ -117,8 +142,26 @@ class MT5Connector:
         Fetch OHLCV + tick volume from MT5.
         Returns DataFrame with columns: time, open, high, low, close, tick_volume.
         """
-        if self._sim_mode:
-            return self._sim_ohlcv(symbol, timeframe, count)
+        if self._http_mode:
+            try:
+                r = requests.get(
+                    f"{MT5_SERVER_URL}/ohlcv",
+                    params={"symbol": symbol, "timeframe": timeframe, "count": count},
+                    timeout=15
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if not data:
+                        return None
+                    df = pd.DataFrame(data)
+                    df["time"] = pd.to_datetime(df["time"], unit="s")
+                    df = df[["time", "open", "high", "low", "close", "tick_volume"]].copy()
+                    df.rename(columns={"tick_volume": "volume"}, inplace=True)
+                    df.set_index("time", inplace=True)
+                    return df
+            except Exception as e:
+                logger.error("HTTP error fetching OHLCV for %s: %s", symbol, e)
+            return None
 
         rates = mt5.copy_rates_from_pos(symbol, _tf_const(timeframe), 0, count)
         if rates is None or len(rates) == 0:
@@ -151,8 +194,15 @@ class MT5Connector:
     # ── Symbol Info ────────────────────────────────────────────────
 
     def get_symbol_info(self, symbol: str) -> Optional[dict]:
-        if self._sim_mode:
-            return {"point": 0.00001, "digits": 5, "trade_contract_size": 100_000}
+        if self._http_mode:
+            try:
+                r = requests.get(f"{MT5_SERVER_URL}/symbol_info", params={"symbol": symbol}, timeout=10)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception as e:
+                logger.error("HTTP error fetching symbol info for %s: %s", symbol, e)
+            return None
+            
         info = mt5.symbol_info(symbol)
         if info is None:
             return None
@@ -167,8 +217,18 @@ class MT5Connector:
         }
 
     def get_tick(self, symbol: str) -> Optional[dict]:
-        if self._sim_mode:
-            return {"bid": 1.10000, "ask": 1.10002, "time": datetime.utcnow()}
+        if self._http_mode:
+            try:
+                r = requests.get(f"{MT5_SERVER_URL}/tick", params={"symbol": symbol}, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    # Convert float timestamp to datetime
+                    data["time"] = datetime.utcfromtimestamp(data["time"])
+                    return data
+            except Exception as e:
+                logger.error("HTTP error fetching tick for %s: %s", symbol, e)
+            return None
+            
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return None
@@ -193,20 +253,20 @@ class MT5Connector:
         Places a market order on MT5.
         In sim mode prints the order and returns a fake result.
         """
-        if self._sim_mode:
-            result = {
-                "status":    "SIMULATED",
-                "symbol":    symbol,
-                "direction": direction,
-                "lot_size":  lot_size,
-                "entry":     entry,
-                "sl":        sl,
-                "tp1":       tp1,
-                "tp2":       tp2,
-                "tp3":       tp3,
-            }
-            logger.info("[SIM ORDER] %s", result)
-            return result
+        if self._http_mode:
+            # We use the HTTP endpoint to execute orders instead of a simulation fallback.
+            # In main.py the bot delegates to ExecutionClient anyway, so MT5Connector 
+            # shouldn't really be placing orders in _http_mode. But just in case, we delegate to ExecutionClient logic.
+            logger.warning("MT5Connector.place_order called in HTTP mode. Delegating via ExecutionClient is preferred.")
+            try:
+                r = requests.post(f"{MT5_SERVER_URL}/buy" if direction == "BUY" else f"{MT5_SERVER_URL}/sell", json={
+                    "symbol": symbol, "volume": lot_size, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "comment": comment
+                }, timeout=15)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception as e:
+                logger.error("HTTP order execution failed: %s", e)
+            return {"status": "FAILED", "reason": "HTTP request failed"}
 
         order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
 
@@ -245,17 +305,24 @@ class MT5Connector:
         }
 
     def get_open_positions(self, symbol: Optional[str] = None) -> list:
-        if self._sim_mode:
+        if self._http_mode:
+            try:
+                r = requests.get(f"{MT5_SERVER_URL}/positions", params={"symbol": symbol} if symbol else {}, timeout=15)
+                if r.status_code == 200:
+                    return r.json().get("positions", [])
+            except Exception as e:
+                logger.error("HTTP error fetching open positions: %s", e)
             return []
+            
         positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
         if positions is None:
             return []
         return list(positions)
 
     def close_position(self, ticket: int) -> bool:
-        if self._sim_mode:
-            logger.info("[SIM] Closing position ticket %d", ticket)
-            return True
+        if self._http_mode:
+            logger.error("close_position via HTTP not implemented yet on server.")
+            return False
         position = mt5.positions_get(ticket=ticket)
         if not position:
             return False
