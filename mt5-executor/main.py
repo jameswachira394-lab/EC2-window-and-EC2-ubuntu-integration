@@ -266,6 +266,90 @@ def sell(order: Order):
     )
 
 
+@app.get("/ohlcv", summary="Fetch historical candles")
+def ohlcv(symbol: str, timeframe: str, count: int = 300):
+    """
+    Fetch OHLCV historical data.
+    `timeframe` should be a string like "M15", "H1", "H4", "D1".
+    """
+    _guard_mt5()
+    _ensure_symbol(symbol.upper())
+    
+    mapping = {
+        "M1":  mt5.TIMEFRAME_M1,
+        "M5":  mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30,
+        "H1":  mt5.TIMEFRAME_H1,
+        "H4":  mt5.TIMEFRAME_H4,
+        "D1":  mt5.TIMEFRAME_D1,
+    }
+    tf_const = mapping.get(timeframe.upper(), mt5.TIMEFRAME_H1)
+    
+    rates = mt5.copy_rates_from_pos(symbol.upper(), tf_const, 0, count)
+    if rates is None or len(rates) == 0:
+        return []
+    
+    # Convert numpy recarray to list of dicts
+    result = []
+    for r in rates:
+        result.append({
+            "time": r['time'],
+            "open": r['open'],
+            "high": r['high'],
+            "low": r['low'],
+            "close": r['close'],
+            "tick_volume": r['tick_volume'],
+            "spread": r['spread'],
+            "real_volume": r['real_volume']
+        })
+    return result
+
+
+@app.get("/tick", summary="Fetch current tick")
+def tick(symbol: str):
+    """
+    Fetch current bid/ask tick for a symbol.
+    """
+    _guard_mt5()
+    _ensure_symbol(symbol.upper())
+    
+    t = mt5.symbol_info_tick(symbol.upper())
+    if t is None:
+        raise HTTPException(status_code=400, detail=f"Tick data unavailable for {symbol}")
+        
+    return {
+        "time": t.time,
+        "bid": t.bid,
+        "ask": t.ask,
+        "last": t.last,
+        "volume": t.volume
+    }
+
+
+@app.get("/symbol_info", summary="Fetch symbol properties")
+def symbol_info(symbol: str):
+    """
+    Fetch static/dynamic properties for a symbol.
+    """
+    _guard_mt5()
+    info = mt5.symbol_info(symbol.upper())
+    if info is None:
+        raise HTTPException(status_code=400, detail=f"Symbol not found: {symbol}")
+        
+    return {
+        "point": info.point,
+        "digits": info.digits,
+        "trade_contract_size": info.trade_contract_size,
+        "volume_min": info.volume_min,
+        "volume_max": info.volume_max,
+        "volume_step": info.volume_step,
+        "spread": info.spread,
+        "visible": info.visible
+    }
+
+
+
 @app.get("/positions", summary="List open positions")
 def positions(symbol: Optional[str] = None):
     """
