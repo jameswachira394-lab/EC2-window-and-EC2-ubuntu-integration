@@ -1,13 +1,3 @@
-# Institutional Forex Trading System — Full Documentation
-
-> **Version:** 2.0 (Stage 2 — EC2 Split Architecture)  
-> **Last Updated:** June 2026  
-> **Repository:** [EC2-window-and-EC2-ubuntu-integration](https://github.com/jameswachira394-lab/EC2-window-and-EC2-ubuntu-integration)
-
----
-
-## Table of Contents
-
 1. [System Overview](#1-system-overview)
 2. [Architecture](#2-architecture)
 3. [Repository Structure](#3-repository-structure)

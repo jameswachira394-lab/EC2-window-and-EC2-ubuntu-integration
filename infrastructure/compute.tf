@@ -1,5 +1,28 @@
+# ---------------- Ubuntu EC2 (Canonical Stable AMI) ----------------
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+
+  owners = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+}
+
 resource "aws_instance" "ubuntu" {
-  ami           = "ami-0c02fb55956c7d316"
+  ami           = data.aws_ami.ubuntu.id
   instance_type = var.instance_type
 
   key_name = "forex-mt5-key"
@@ -11,20 +34,26 @@ resource "aws_instance" "ubuntu" {
 
   associate_public_ip_address = true
 
-
   user_data = <<-EOF
               #!/bin/bash
-              apt update -y
-              apt install -y nginx amazon-cloudwatch-agent
-              systemctl start nginx
+              set -e
+
+              apt-get update -y
+              apt-get install -y nginx amazon-cloudwatch-agent
+
               systemctl enable nginx
+              systemctl start nginx
+
               echo "Ubuntu EC2 running with Terraform" > /var/www/html/index.html
               EOF
 
   tags = {
     Name = "ubuntu-ec2"
+    OS   = "ubuntu"
   }
 }
+
+# ---------------- Windows AMI (Hardened Filter) ----------------
 
 data "aws_ami" "windows" {
   most_recent = true
@@ -39,6 +68,11 @@ data "aws_ami" "windows" {
   filter {
     name   = "virtualization-type"
     values = ["hvm"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
   }
 }
 
@@ -57,5 +91,6 @@ resource "aws_instance" "windows" {
 
   tags = {
     Name = "windows-ec2"
+    OS   = "windows"
   }
 }
