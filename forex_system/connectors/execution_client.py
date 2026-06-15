@@ -23,7 +23,7 @@ _MT5_SERVER_URL = os.environ.get(
     "http://10.0.1.153:8000",   # override with env var on Ubuntu EC2
 ).rstrip("/")
 
-# Timeout for each HTTP request (seconds)
+# Timeout for each HTTP request (seconds) 
 _TIMEOUT = 10
 
 
