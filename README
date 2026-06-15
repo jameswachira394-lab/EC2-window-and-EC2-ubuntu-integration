@@ -193,7 +193,7 @@ Replaces all direct `mt5.order_send()` calls. Sends HTTP requests to the Windows
 ```bash
 MT5_SERVER_URL=http://<windows-ec2-ip>:8000
 ```
-Falls back to `http://localhost:8000` if not set.
+Falls back to `http://10.0.1.153:8000` if not set.
 
 ---
 
@@ -369,7 +369,7 @@ All settings are in [`forex_system/config/settings.py`](forex_system/config/sett
 ```python
 # Set via environment variable on Ubuntu EC2:
 # export MT5_SERVER_URL=http://<windows-ec2-private-ip>:8000
-MT5_SERVER_URL = os.environ.get("MT5_SERVER_URL", "http://localhost:8000")
+MT5_SERVER_URL = os.environ.get("MT5_SERVER_URL", "http://10.0.1.153:8000")
 ```
 
 ### Tradeable Symbols
@@ -500,7 +500,7 @@ pip install -r requirements.txt
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 # 4. Verify
-# Open browser: http://localhost:8000/docs
+# Open browser: http://10.0.1.153:8000/docs
 ```
 
 **Run as a background service (recommended):**
@@ -567,7 +567,7 @@ python main.py --dry-run --scan-once
 python main.py --dry-run --symbol EURUSD --scan-once
 
 # Live loop (calls Windows MT5 server for execution)
-MT5_SERVER_URL=http://localhost:8000 python main.py
+MT5_SERVER_URL=http://10.0.1.153:8000 python main.py
 ```
 
 ---

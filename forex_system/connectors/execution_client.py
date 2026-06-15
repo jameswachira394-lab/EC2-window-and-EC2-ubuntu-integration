@@ -18,7 +18,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Server URL ─────────────────────────────────────────────────────
-_DEFAULT_URL = "http://localhost:8000"
+_DEFAULT_URL = "http://10.0.1.153:8000"
 SERVER_URL = os.environ.get("MT5_SERVER_URL", _DEFAULT_URL).rstrip("/")
 
 try:
