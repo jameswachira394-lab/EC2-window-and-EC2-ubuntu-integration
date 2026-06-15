@@ -151,12 +151,22 @@ class MT5Connector:
                 )
                 if r.status_code == 200:
                     body = r.json()
-                    records = body.get("data", body)  # new server wraps in {"data": [...]}
+
+                    if isinstance(body, list):
+                        records = body
+                    else:
+                        records = body.get("data", [])
+
                     if not records:
                         return None
+
                     df = pd.DataFrame(records)
-                    # Server sends ISO strings; fall back to epoch if needed
+
                     df["time"] = pd.to_datetime(df["time"], utc=True, format="mixed")
+
+                    if "tick_volume" in df.columns:
+                        df.rename(columns={"tick_volume": "volume"}, inplace=True)
+
                     df = df[["time", "open", "high", "low", "close", "volume"]].copy()
                     df.set_index("time", inplace=True)
                     return df
