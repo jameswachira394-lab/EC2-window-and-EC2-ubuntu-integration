@@ -17,7 +17,7 @@ MT5_CONFIG = {
 import os
 MT5_SERVER_URL = os.environ.get(
     "MT5_SERVER_URL",
-    "http://localhost:8000",   # default (same machine / dev)
+    "http://10.0.1.153:8000",   # default (same machine / dev)
 )
 
 # ─── Tradeable Pairs ───────────────────────────────────────────────

@@ -10,6 +10,6 @@ COPY . .
 
 # Windows EC2 IP injected at runtime:
 #   docker run -e MT5_SERVER_URL=http://<windows-ip>:8000 forex-bot
-ENV MT5_SERVER_URL=http://localhost:8000
+ENV MT5_SERVER_URL=http://10.0.1.153:8000" 
 
 CMD ["python", "main.py"]
