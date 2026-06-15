@@ -25,6 +25,8 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import numpy as np
+
 import MetaTrader5 as mt5
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -89,6 +91,26 @@ class Order(BaseModel):
 
 
 # ── Internal helpers ──────────────────────────────────────────────
+
+def _clean(obj):
+    """
+    Recursively convert NumPy types to native Python types
+    so FastAPI's JSON encoder can serialize the response.
+    """
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
 
 def _guard_mt5():
     """Raise 503 if MT5 is not connected."""
@@ -186,7 +208,7 @@ def _send_order(
             result.retcode, result.comment,
         )
 
-    return {
+    return _clean({
         "status":  "FILLED" if success else "FAILED",
         "retcode": result.retcode,
         "order":   result.order,
@@ -195,7 +217,7 @@ def _send_order(
         "bid":     tick.bid,
         "ask":     tick.ask,
         "comment": result.comment,
-    }
+    })
 
 
 # ── Endpoints ─────────────────────────────────────────────────────
@@ -214,7 +236,7 @@ def health():
             "balance":       None,
             "message":       "MT5 not connected — check that MetaTrader5 is open and logged in.",
         }
-    return {
+    return _clean({
         "status":        "ok",
         "mt5_connected": True,
         "account":       info.login,
@@ -223,7 +245,7 @@ def health():
         "currency":      info.currency,
         "server":        info.server,
         "leverage":      info.leverage,
-    }
+    })
 
 
 @app.post("/buy", summary="Place BUY market order")
@@ -290,20 +312,10 @@ def ohlcv(symbol: str, timeframe: str, count: int = 300):
     if rates is None or len(rates) == 0:
         return []
     
-    # Convert numpy recarray to list of dicts
-    result = []
-    for r in rates:
-        result.append({
-            "time": r['time'],
-            "open": r['open'],
-            "high": r['high'],
-            "low": r['low'],
-            "close": r['close'],
-            "tick_volume": r['tick_volume'],
-            "spread": r['spread'],
-            "real_volume": r['real_volume']
-        })
-    return result
+    # Convert numpy recarray to list of dicts (native Python types)
+    import pandas as pd
+    df = pd.DataFrame(rates)
+    return _clean(df.to_dict(orient="records"))
 
 
 @app.get("/tick", summary="Fetch current tick")
@@ -318,13 +330,13 @@ def tick(symbol: str):
     if t is None:
         raise HTTPException(status_code=400, detail=f"Tick data unavailable for {symbol}")
         
-    return {
+    return _clean({
         "time": t.time,
         "bid": t.bid,
         "ask": t.ask,
         "last": t.last,
         "volume": t.volume
-    }
+    })
 
 
 @app.get("/symbol_info", summary="Fetch symbol properties")
@@ -337,7 +349,7 @@ def symbol_info(symbol: str):
     if info is None:
         raise HTTPException(status_code=400, detail=f"Symbol not found: {symbol}")
         
-    return {
+    return _clean({
         "point": info.point,
         "digits": info.digits,
         "trade_contract_size": info.trade_contract_size,
@@ -346,7 +358,7 @@ def symbol_info(symbol: str):
         "volume_step": info.volume_step,
         "spread": info.spread,
         "visible": info.visible
-    }
+    })
 
 
 
@@ -362,7 +374,7 @@ def positions(symbol: Optional[str] = None):
     if pos is None:
         return {"positions": [], "count": 0}
 
-    return {
+    return _clean({
         "positions": [
             {
                 "ticket":       p.ticket,
@@ -381,4 +393,4 @@ def positions(symbol: Optional[str] = None):
             for p in pos
         ],
         "count": len(pos),
-    }
+    })
