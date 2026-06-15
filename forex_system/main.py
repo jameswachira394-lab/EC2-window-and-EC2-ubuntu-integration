@@ -23,7 +23,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── ensure project root is importable ────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config.settings import (
@@ -36,7 +35,6 @@ from core.risk_manager import RiskManager
 from utils.signal_logger import SignalLogger
 from utils.news_filter import load_news_events
 
-# ── Logging setup ─────────────────────────────────────────────────
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -49,31 +47,24 @@ logging.basicConfig(
 logger = logging.getLogger("TradingBot")
 
 
-# ─── Bot Class ────────────────────────────────────────────────────
-
 class TradingBot:
 
     def __init__(
         self,
-        scan_interval: int   = 60,    # seconds between scans
-        dry_run:       bool  = False,  # True = log signals but never execute
-        symbols:       list  = None,
+        scan_interval: int  = 60,
+        dry_run:       bool = False,
+        symbols:       list = None,
     ):
         self.scan_interval = scan_interval
         self.dry_run       = dry_run
         self.symbols       = symbols or SYMBOLS
 
-        # Data layer  — runs in simulation mode on Ubuntu (no MT5 installed)
-        self.mt5       = MT5Connector()
-        # Execution layer — HTTP client → Windows MT5 server
-        self.executor  = ExecutionClient()
-        self.logger    = SignalLogger()
+        self.mt5      = MT5Connector()        # data layer (sim on Ubuntu)
+        self.executor = ExecutionClient()     # execution → Windows MT5 server
+        self.logger   = SignalLogger()
 
-        # Placeholders — initialized after MT5 connects
         self.engine   = None
         self.risk_mgr = None
-
-    # ── Lifecycle ──────────────────────────────────────────────────
 
     def start(self, scan_once: bool = False):
         logger.info("=" * 60)
@@ -103,23 +94,19 @@ class TradingBot:
             logger.info("Bot stopped.")
 
     def _run_loop(self):
-        logger.info("Entering main scan loop (interval=%ds). Press Ctrl+C to stop.", self.scan_interval)
+        logger.info("Entering main scan loop (interval=%ds). Ctrl+C to stop.", self.scan_interval)
         while True:
             self._scan_all()
             logger.info("Scan complete. Sleeping %ds...", self.scan_interval)
             time.sleep(self.scan_interval)
-
-    # ── Core Scan ─────────────────────────────────────────────────
 
     def _scan_all(self):
         utc_now     = datetime.now(timezone.utc).replace(tzinfo=None)
         news_events = load_news_events()
         balance     = self.mt5.get_account_balance()
 
-        # Update engine with latest balance
         self.engine.balance = balance
 
-        # Risk gate
         ok, reason = self.risk_mgr.can_trade(balance)
         if not ok:
             logger.warning("TRADING HALTED: %s", reason)
@@ -131,13 +118,7 @@ class TradingBot:
             except Exception as e:
                 logger.exception("Error processing %s: %s", symbol, e)
 
-    def _process_symbol(
-        self,
-        symbol:      str,
-        utc_now:     datetime,
-        news_events: list,
-    ):
-        # ── Fetch OHLCV ──────────────────────────────────────────
+    def _process_symbol(self, symbol, utc_now, news_events):
         df_h4  = self.mt5.get_ohlcv(symbol, "H4")
         df_h1  = self.mt5.get_ohlcv(symbol, "H1")
         df_m15 = self.mt5.get_ohlcv(symbol, "M15")
@@ -146,7 +127,6 @@ class TradingBot:
             logger.warning("Skipping %s — missing data.", symbol)
             return
 
-        # ── Generate signal ───────────────────────────────────────
         signal = self.engine.evaluate(
             symbol     = symbol,
             df_h4      = df_h4,
@@ -156,14 +136,10 @@ class TradingBot:
             utc_now    = utc_now,
         )
 
-        # ── Log signal ────────────────────────────────────────────
         self.logger.log(signal)
-
-        # ── Print formatted output ────────────────────────────────
         print("\n" + format_signal(signal))
 
-        # ── Execute if warranted ──────────────────────────────────
-        if signal.decision in ("EXECUTE TRADE",) and signal.direction != "NO_TRADE":
+        if signal.decision == "EXECUTE TRADE" and signal.direction != "NO_TRADE":
             self._execute_signal(signal)
 
     def _execute_signal(self, signal):
@@ -172,7 +148,7 @@ class TradingBot:
                         signal.pair, signal.direction, signal.confidence)
             return
 
-        # Check for existing position via the Windows MT5 server
+        # Check existing position via Windows MT5 server
         existing = self.executor.get_open_positions(symbol=signal.pair)
         if existing:
             logger.info("Skipping %s — position already open.", signal.pair)
@@ -180,7 +156,6 @@ class TradingBot:
 
         direction_str = "BUY" if signal.direction == "LONG" else "SELL"
 
-        # ── Delegate execution to the Windows MT5 server via HTTP ──
         result = self.executor.place_order(
             symbol    = signal.pair,
             direction = direction_str,
@@ -196,18 +171,12 @@ class TradingBot:
         logger.info("Order result: %s", result)
 
 
-# ─── CLI Entry Point ──────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="Institutional Forex Trading Bot")
-    parser.add_argument("--scan-once",  action="store_true",
-                        help="Run one scan then exit")
-    parser.add_argument("--dry-run",    action="store_true",
-                        help="Generate signals but do not place orders")
-    parser.add_argument("--symbol",     type=str, default=None,
-                        help="Scan a single symbol only (e.g. EURUSD)")
-    parser.add_argument("--interval",   type=int, default=60,
-                        help="Scan interval in seconds (default 60)")
+    parser.add_argument("--scan-once", action="store_true")
+    parser.add_argument("--dry-run",   action="store_true")
+    parser.add_argument("--symbol",    type=str, default=None)
+    parser.add_argument("--interval",  type=int, default=60)
     args = parser.parse_args()
 
     symbols = [args.symbol.upper()] if args.symbol else None

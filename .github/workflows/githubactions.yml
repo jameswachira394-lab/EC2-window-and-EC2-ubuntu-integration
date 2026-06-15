@@ -88,7 +88,9 @@ jobs:
         run: pip install -r mt5-executor/requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile mt5-executor/main.py
+        run: |
+          python -m py_compile mt5-executor/main.py
+          python -m py_compile mt5-executor/mt5_server.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

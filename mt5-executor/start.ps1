@@ -42,4 +42,4 @@ Write-Host "══════════════════════�
 Write-Host ""
 
 # ── Start uvicorn ────────────────────────────────────────────────
-python -m uvicorn main:app --host $Host --port $Port --reload
+python -m uvicorn mt5_server:app --host $Host --port $Port --reload

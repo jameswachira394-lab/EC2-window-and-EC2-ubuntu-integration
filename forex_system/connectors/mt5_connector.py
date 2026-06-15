@@ -67,12 +67,12 @@ class MT5Connector:
             logger.info("Connecting via HTTP to MT5 server: %s", MT5_SERVER_URL)
             try:
                 r = requests.get(f"{MT5_SERVER_URL}/health", timeout=10)
-                if r.status_code == 200 and r.json().get("mt5_connected"):
+                if r.status_code == 200 and r.json().get("status") == "ok":
                     logger.info("HTTP MT5 server connected successfully.")
                     self.connected = True
                     return True
                 else:
-                    logger.error("HTTP MT5 server responded, but MT5 is not connected on the Windows side.")
+                    logger.error("HTTP MT5 server responded, but status is not OK.")
                     return False
             except Exception as e:
                 logger.error("Failed to connect to HTTP MT5 server: %s", e)
@@ -112,26 +112,26 @@ class MT5Connector:
     def get_account_balance(self) -> float:
         if self._http_mode:
             try:
-                r = requests.get(f"{MT5_SERVER_URL}/health", timeout=10)
+                r = requests.get(f"{MT5_SERVER_URL}/account", timeout=10)
                 if r.status_code == 200:
                     return float(r.json().get("balance", 0.0))
             except Exception as e:
                 logger.error("Failed to fetch balance via HTTP: %s", e)
             return 0.0
-            
+
         info = mt5.account_info()
         return info.balance if info else 0.0
 
     def get_account_equity(self) -> float:
         if self._http_mode:
             try:
-                r = requests.get(f"{MT5_SERVER_URL}/health", timeout=10)
+                r = requests.get(f"{MT5_SERVER_URL}/account", timeout=10)
                 if r.status_code == 200:
                     return float(r.json().get("equity", 0.0))
             except Exception as e:
                 logger.error("Failed to fetch equity via HTTP: %s", e)
             return 0.0
-            
+
         info = mt5.account_info()
         return info.equity if info else 0.0
 
@@ -150,13 +150,14 @@ class MT5Connector:
                     timeout=15
                 )
                 if r.status_code == 200:
-                    data = r.json()
-                    if not data:
+                    body = r.json()
+                    records = body.get("data", body)  # new server wraps in {"data": [...]}
+                    if not records:
                         return None
-                    df = pd.DataFrame(data)
-                    df["time"] = pd.to_datetime(df["time"], unit="s")
-                    df = df[["time", "open", "high", "low", "close", "tick_volume"]].copy()
-                    df.rename(columns={"tick_volume": "volume"}, inplace=True)
+                    df = pd.DataFrame(records)
+                    # Server sends ISO strings; fall back to epoch if needed
+                    df["time"] = pd.to_datetime(df["time"], utc=True, format="mixed")
+                    df = df[["time", "open", "high", "low", "close", "volume"]].copy()
                     df.set_index("time", inplace=True)
                     return df
             except Exception as e:
@@ -254,14 +255,17 @@ class MT5Connector:
         In sim mode prints the order and returns a fake result.
         """
         if self._http_mode:
-            # We use the HTTP endpoint to execute orders instead of a simulation fallback.
-            # In main.py the bot delegates to ExecutionClient anyway, so MT5Connector 
-            # shouldn't really be placing orders in _http_mode. But just in case, we delegate to ExecutionClient logic.
-            logger.warning("MT5Connector.place_order called in HTTP mode. Delegating via ExecutionClient is preferred.")
+            logger.warning("MT5Connector.place_order called in HTTP mode. Use ExecutionClient instead.")
             try:
-                r = requests.post(f"{MT5_SERVER_URL}/buy" if direction == "BUY" else f"{MT5_SERVER_URL}/sell", json={
-                    "symbol": symbol, "volume": lot_size, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "comment": comment
-                }, timeout=15)
+                r = requests.post(
+                    f"{MT5_SERVER_URL}/order",
+                    json={
+                        "symbol": symbol, "direction": direction, "lot_size": lot_size,
+                        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                        "comment": comment,
+                    },
+                    timeout=15,
+                )
                 if r.status_code == 200:
                     return r.json()
             except Exception as e:
@@ -321,7 +325,15 @@ class MT5Connector:
 
     def close_position(self, ticket: int) -> bool:
         if self._http_mode:
-            logger.error("close_position via HTTP not implemented yet on server.")
+            try:
+                r = requests.post(
+                    f"{MT5_SERVER_URL}/positions/{ticket}/close",
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    return r.json().get("success", False)
+            except Exception as e:
+                logger.error("HTTP close_position failed: %s", e)
             return False
         position = mt5.positions_get(ticket=ticket)
         if not position:
