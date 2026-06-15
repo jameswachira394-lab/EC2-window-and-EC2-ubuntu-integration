@@ -21,6 +21,7 @@ MT5_SERVER_URL = os.environ.get(
 )
 
 # ─── Tradeable Pairs ───────────────────────────────────────────────
+
 SYMBOLS = [
     "EURUSD", "GBPUSD", "USDJPY",
     "USDCHF", "AUDUSD", "NZDUSD",
