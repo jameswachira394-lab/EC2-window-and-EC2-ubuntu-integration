@@ -24,7 +24,7 @@ _MT5_SERVER_URL = os.environ.get(
 ).rstrip("/")
 
 # Timeout for each HTTP request (seconds) 
-_TIMEOUT = 60
+_TIMEOUT = 10
 
 
 class ExecutionClient:
