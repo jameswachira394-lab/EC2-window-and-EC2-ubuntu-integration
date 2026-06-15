@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Read server IP from environment variable or fall back to config
 _MT5_SERVER_URL = os.environ.get(
     "MT5_SERVER_URL",
-    "http://localhost:8000",   # override with env var on Ubuntu EC2
+    "http://10.0.1.153:8000",   # override with env var on Ubuntu EC2
 ).rstrip("/")
 
 # Timeout for each HTTP request (seconds)
