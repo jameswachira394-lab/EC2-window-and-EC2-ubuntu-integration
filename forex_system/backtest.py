@@ -6,7 +6,7 @@ produce a performance report.
 
 Usage:
     python backtest.py --symbol EURUSD --start 2024-01-01 --end 2024-12-31
-    python backtest.py --csv data/EURUSD_H1.csv --timeframe H1
+    python backtest.py --csv data/EURUSD_M15.csv --timeframe M15
 """
 
 from __future__ import annotations
@@ -41,14 +41,12 @@ class Backtester:
 
     def run_on_dataframe(
         self,
-        df_h4:  pd.DataFrame,
-        df_h1:  pd.DataFrame,
         df_m15: pd.DataFrame,
         symbol: str = "TEST",
         step:   int = 1,    # evaluate every N rows
     ):
         """
-        Walk forward through df_m15, using matching H4/H1 slices.
+        Walk forward through df_m15.
         step: evaluate every `step` M15 candles (speeds up large datasets).
         """
         warmup = 60   # candles needed before meaningful indicators
@@ -61,19 +59,23 @@ class Backtester:
             ts = df_m15.index[i]
             m15_slice = df_m15.iloc[:i + 1]
 
-            # Match H4 / H1 up to the same timestamp
-            h4_slice  = df_h4[df_h4.index  <= ts].tail(200) if len(df_h4)  else None
-            h1_slice  = df_h1[df_h1.index  <= ts].tail(300) if len(df_h1)  else None
+            # Context for yesterday
+            dates = pd.Series(m15_slice.index.date).unique()
+            if len(dates) < 2:
+                continue
 
-            if h4_slice is None or h1_slice is None or len(h4_slice) < 60 or len(h1_slice) < 60:
+            prev_date = dates[-2]
+            df_yesterday = m15_slice[m15_slice.index.date == prev_date]
+
+            if df_yesterday.empty:
                 continue
 
             try:
+                ctx = self.engine.build_yesterday_context(df_yesterday)
                 sig = self.engine.evaluate(
                     symbol    = symbol,
-                    df_h4     = h4_slice,
-                    df_h1     = h1_slice,
                     df_m15    = m15_slice.tail(300),
+                    ctx       = ctx,
                     utc_now   = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
                     news_times= [],
                 )
@@ -196,12 +198,10 @@ def main():
     mt5.connect()
 
     print(f"Fetching data for {args.symbol}...")
-    df_h4  = mt5.get_ohlcv(args.symbol, "H4",  count=500)
-    df_h1  = mt5.get_ohlcv(args.symbol, "H1",  count=1000)
     df_m15 = mt5.get_ohlcv(args.symbol, "M15", count=2000)
 
     bt = Backtester(balance=args.balance)
-    bt.run_on_dataframe(df_h4, df_h1, df_m15, symbol=args.symbol, step=args.step)
+    bt.run_on_dataframe(df_m15, symbol=args.symbol, step=args.step)
 
 
 if __name__ == "__main__":

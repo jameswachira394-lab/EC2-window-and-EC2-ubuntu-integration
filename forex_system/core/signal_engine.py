@@ -1,31 +1,36 @@
 """
-Signal Engine
-─────────────
-Implements Steps 1–13 of the Institutional Forex Trading System.
+Signal Engine  v2  —  Yesterday-Volume-Driven
+──────────────────────────────────────────────
+Bias and entry zone come exclusively from yesterday's:
+    • Volume Profile  (POC / VAH / VAL)
+    • CVD             (cumulative volume delta)
+    • Absorption zones (large volume / small body candles)
+
+Today's price action only needs to:
+    1. Return to the entry zone derived from yesterday
+    2. Show ONE of:  rejection candle | CVD shift | absorption signal
+
+Price-action indicators (EMAs, swing points) are used only for
+stop-loss placement and TP targeting — NOT for bias.
 """
 
 from __future__ import annotations
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
+import numpy as np
 
 from config.settings import (
-    EMA_FAST, EMA_SLOW,
-    VOLUME_RATIO_MIN,
     MIN_RR, TP1_ATR_MULT, TP2_ATR_MULT,
     MIN_CONFIDENCE,
     ALLOWED_SESSION_HOURS_UTC,
     NEWS_BLACKOUT_MINUTES,
 )
-from core.indicators import (
-    add_emas, add_atr, add_volume_ratio, get_swing_points,
-    classify_trend, classify_market_structure,
-    detect_liquidity_sweep, detect_breakout,
-    is_atr_expanding, is_atr_compressed,
-)
+from core.indicators import add_atr, get_swing_points
+from core.volume_profile import YesterdayContext, YesterdayContextBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -34,31 +39,38 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TradeSignal:
-    pair:          str
-    direction:     str       # LONG | SHORT | NO_TRADE
-    confidence:    int
-    entry:         float
-    stop_loss:     float
-    tp1:           float
-    tp2:           float
-    tp3:           float
-    risk_reward:   float
-    lot_size:      float
-    decision:      str       # EXECUTE | REVIEW | NO_TRADE
+    pair:           str
+    direction:      str        # LONG | SHORT | NO_TRADE
+    confidence:     int
+    entry:          float
+    stop_loss:      float
+    tp1:            float
+    tp2:            float
+    tp3:            float
+    risk_reward:    float
+    lot_size:       float
+    decision:       str        # EXECUTE | REVIEW MANUALLY | NO TRADE
 
-    # Diagnostics
-    trend_h4:      str = "neutral"
-    trend_h1:      str = "neutral"
-    trend_m15:     str = "neutral"
-    structure:     str = "neutral"
-    sweep:         dict = field(default_factory=dict)
-    volume_ratio:  float = 0.0
-    atr_current:   float = 0.0
-    atr_expanding: bool = False
-    atr_compressed:bool = False
-    breakout:      dict = field(default_factory=dict)
-    rejection_log: list = field(default_factory=list)
-    timestamp:     str  = ""
+    # Yesterday context summary
+    yest_bias:      str   = ""
+    yest_poc:       float = 0.0
+    yest_vah:       float = 0.0
+    yest_val:       float = 0.0
+    yest_cvd_bias:  str   = ""
+    cvd_divergence: bool  = False
+    entry_zone_high: float = 0.0
+    entry_zone_low:  float = 0.0
+    absorptions_count: int = 0
+
+    # Today confirmation
+    in_entry_zone:  bool  = False
+    rejection_candle: bool = False
+    cvd_confirmed:  bool  = False
+    absorption_confirmed: bool = False
+
+    atr_current:    float = 0.0
+    rejection_log:  list  = field(default_factory=list)
+    timestamp:      str   = ""
 
 
 # ─── Session / News Filters ───────────────────────────────────────
@@ -67,12 +79,11 @@ def is_valid_session(utc_now: datetime) -> bool:
     return utc_now.hour in ALLOWED_SESSION_HOURS_UTC
 
 
-def is_news_blackout(utc_now: datetime, news_times_utc: list[datetime]) -> bool:
+def is_news_blackout(utc_now: datetime, news_times_utc: list) -> bool:
     from datetime import timedelta
-    window = NEWS_BLACKOUT_MINUTES * 60  # seconds
+    window = NEWS_BLACKOUT_MINUTES * 60
     for nt in news_times_utc:
-        delta = abs((utc_now - nt).total_seconds())
-        if delta <= window:
+        if abs((utc_now - nt).total_seconds()) <= window:
             return True
     return False
 
@@ -80,46 +91,132 @@ def is_news_blackout(utc_now: datetime, news_times_utc: list[datetime]) -> bool:
 # ─── Lot Size Calculator ──────────────────────────────────────────
 
 def calculate_lot_size(
-    balance:       float,
-    risk_pct:      float,
-    entry:         float,
-    stop_loss:     float,
-    point_value:   float = 10.0,   # USD per pip per standard lot (default EURUSD)
-    pip_size:      float = 0.0001,
+    balance:     float,
+    risk_pct:    float,
+    entry:       float,
+    stop_loss:   float,
+    point_value: float = 10.0,
+    pip_size:    float = 0.0001,
 ) -> float:
-    """
-    Risk-based lot sizing.
-    risk_amount  = balance × risk_pct / 100
-    pips_at_risk = |entry − stop_loss| / pip_size
-    lot_size     = risk_amount / (pips_at_risk × point_value)
-    """
     risk_amount  = balance * risk_pct / 100.0
     pips_at_risk = abs(entry - stop_loss) / pip_size
     if pips_at_risk <= 0:
         return 0.01
-    lot = risk_amount / (pips_at_risk * point_value)
-    return round(max(0.01, lot), 2)
+    return round(max(0.01, risk_amount / (pips_at_risk * point_value)), 2)
+
+
+# ─── Today Confirmation Checks ────────────────────────────────────
+
+def check_in_entry_zone(price: float, ctx: YesterdayContext) -> bool:
+    """Is current price inside yesterday's derived entry zone?"""
+    return ctx.entry_zone_low <= price <= ctx.entry_zone_high
+
+
+def check_rejection_candle(df: pd.DataFrame, bias: str) -> bool:
+    """
+    Last candle shows rejection of the entry zone:
+    - LONG: long lower wick, close in upper 40 % of range
+    - SHORT: long upper wick, close in lower 40 % of range
+    """
+    c = df.iloc[-1]
+    candle_range = c["high"] - c["low"]
+    if candle_range == 0:
+        return False
+
+    body_top    = max(c["open"], c["close"])
+    body_bottom = min(c["open"], c["close"])
+    upper_wick  = c["high"] - body_top
+    lower_wick  = body_bottom - c["low"]
+
+    if bias == "bullish":
+        return (
+            lower_wick > candle_range * 0.45 and
+            c["close"]  > c["low"] + candle_range * 0.60
+        )
+    else:  # bearish
+        return (
+            upper_wick > candle_range * 0.45 and
+            c["close"]  < c["high"] - candle_range * 0.60
+        )
+
+
+def check_cvd_shift(df: pd.DataFrame, bias: str, lookback: int = 5) -> bool:
+    """
+    In the last N candles, is volume delta shifting in the bias direction?
+    Bullish: last 3 candles have net positive delta (more up volume than down)
+    Bearish: last 3 candles have net negative delta
+    """
+    recent = df.tail(lookback).copy()
+    recent["delta"] = np.where(
+        recent["close"] > recent["open"],  recent["volume"],
+        np.where(recent["close"] < recent["open"], -recent["volume"], 0.0)
+    )
+    net_delta = recent["delta"].sum()
+    if bias == "bullish":
+        return net_delta > 0
+    else:
+        return net_delta < 0
+
+
+def check_absorption_today(df: pd.DataFrame, ctx: YesterdayContext, bias: str) -> bool:
+    """
+    Is there absorption near the entry zone in today's recent candles?
+    Checks last 3 candles for high-volume / small-body pattern.
+    """
+    recent      = df.tail(3)
+    vol_median  = df["volume"].median()
+    for _, row in recent.iterrows():
+        candle_range = row["high"] - row["low"]
+        if candle_range == 0:
+            continue
+        body       = abs(row["close"] - row["open"])
+        body_ratio = body / candle_range
+        high_vol   = row["volume"] >= vol_median * 1.5
+        small_body = body_ratio <= 0.35
+
+        if not (high_vol and small_body):
+            continue
+
+        # Must be near the entry zone
+        candle_mid = (row["high"] + row["low"]) / 2
+        in_zone    = ctx.entry_zone_low <= candle_mid <= ctx.entry_zone_high
+        if not in_zone:
+            continue
+
+        # Side check
+        mid = (row["high"] + row["low"]) / 2
+        if bias == "bullish" and row["close"] > mid:
+            return True   # bid absorption (buyers eating sells near VAL/POC)
+        if bias == "bearish" and row["close"] < mid:
+            return True   # ask absorption (sellers eating buys near POC/VAH)
+
+    return False
 
 
 # ─── Confidence Scorer ────────────────────────────────────────────
 
 def compute_confidence(checks: dict) -> int:
     """
-    Weighted scoring across all signal components.
+    Weights reflecting the new yesterday-volume-first approach.
     Max = 100.
     """
     weights = {
-        "h4_trend":          20,
-        "h1_trend":          15,
-        "structure":         15,
-        "sweep":             15,
-        "volume":            12,
-        "breakout":          10,
-        "atr_compressed":     5,
-        "atr_expanding":      5,
-        "rr_min":             3,
+        # Yesterday context (determines bias)
+        "yest_vol_bias":    25,   # volume profile bias clear
+        "yest_cvd_bias":    20,   # CVD bias agrees
+        "cvd_divergence":   10,   # divergence adds conviction to reversal
+        "absorption_zone":  10,   # strong absorption zone present
+
+        # Today confirmation (determines entry timing)
+        "in_entry_zone":    15,   # price returned to entry zone
+        "rejection_candle": 10,   # candle shows rejection
+        "cvd_confirmed":     5,   # intraday CVD shifting in bias direction
+        "absorption_today":  5,   # absorption candle today near zone
+
+        # Risk management
+        "rr_ok":            0,    # binary gate — handled separately
     }
-    score = sum(weights[k] for k, v in checks.items() if v)
+    score = sum(weights[k] for k, v in checks.items() if v and k in weights)
     return min(100, score)
 
 
@@ -130,20 +227,28 @@ class SignalEngine:
     def __init__(self, account_balance: float = 10_000.0, risk_pct: float = 1.0):
         self.balance  = account_balance
         self.risk_pct = risk_pct
+        self._ctx_builder = YesterdayContextBuilder()
 
     # ── Public API ─────────────────────────────────────────────────
 
+    def build_yesterday_context(self, df_yesterday: pd.DataFrame) -> YesterdayContext:
+        """
+        Call once per day with yesterday's intraday candles (M15 or H1).
+        Returns a YesterdayContext object to pass into evaluate() all day.
+        """
+        return self._ctx_builder.build(df_yesterday)
+
     def evaluate(
         self,
-        symbol:    str,
-        df_h4:     pd.DataFrame,
-        df_h1:     pd.DataFrame,
-        df_m15:    pd.DataFrame,
-        news_times: list = None,
-        utc_now:    datetime = None,
+        symbol:      str,
+        df_m15:      pd.DataFrame,   # today's live M15 candles
+        ctx:         YesterdayContext,
+        news_times:  list = None,
+        utc_now:     datetime = None,
     ) -> TradeSignal:
         """
-        Run all 13 steps and return a TradeSignal.
+        Run signal evaluation using yesterday's context + today's price action.
+        Call repeatedly as new M15 candles arrive.
         """
         if utc_now is None:
             utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -152,141 +257,123 @@ class SignalEngine:
 
         rejection_log = []
 
-        # ── Prepare data ─────────────────────────────────────────
-        df_h4  = self._prepare(df_h4)
-        df_h1  = self._prepare(df_h1)
-        df_m15 = self._prepare(df_m15)
+        # ── Prepare today's M15 ───────────────────────────────────
+        df = self._prepare(df_m15)
+        current_price = float(df.iloc[-1]["close"])
 
-        # ── STEP 10: Session Filter ───────────────────────────────
+        # ── Session Filter ────────────────────────────────────────
         if not is_valid_session(utc_now):
-            rejection_log.append("Outside allowed sessions (London/NY)")
-            return self._no_trade(symbol, rejection_log, utc_now)
+            rejection_log.append("Outside London/NY session")
+            return self._no_trade(symbol, rejection_log, utc_now, ctx)
 
-        # ── STEP 11: News Filter ──────────────────────────────────
+        # ── News Filter ───────────────────────────────────────────
         if is_news_blackout(utc_now, news_times):
             rejection_log.append("News blackout active")
-            return self._no_trade(symbol, rejection_log, utc_now)
+            return self._no_trade(symbol, rejection_log, utc_now, ctx)
 
-        # ── STEP 1: Higher Timeframe Bias ─────────────────────────
-        trend_h4  = classify_trend(df_h4)
-        trend_h1  = classify_trend(df_h1)
-        trend_m15 = classify_trend(df_m15)
+        # ── STEP 1: Yesterday bias must not be neutral ─────────────
+        if ctx.bias == "neutral":
+            rejection_log.append(
+                f"Yesterday bias neutral — VP and CVD disagreed "
+                f"(VP={ctx.profile.bias}, CVD={ctx.cvd.bias})"
+            )
+            return self._no_trade(symbol, rejection_log, utc_now, ctx)
 
-        if trend_h4 == "neutral" or trend_h1 == "neutral":
-            rejection_log.append(f"Trend conflict H4={trend_h4} H1={trend_h1}")
-            return self._no_trade(symbol, rejection_log, utc_now,
-                                  trend_h4=trend_h4, trend_h1=trend_h1)
+        bias      = ctx.bias
+        direction = "LONG" if bias == "bullish" else "SHORT"
 
-        if trend_h4 != trend_h1:
-            rejection_log.append(f"H4/H1 trend mismatch: H4={trend_h4} H1={trend_h1}")
-            return self._no_trade(symbol, rejection_log, utc_now,
-                                  trend_h4=trend_h4, trend_h1=trend_h1)
+        # ── STEP 2: Invalidation check ────────────────────────────
+        if ctx.invalidation > 0:
+            if bias == "bullish" and current_price < ctx.invalidation:
+                rejection_log.append(
+                    f"Price {current_price:.5f} broke invalidation "
+                    f"{ctx.invalidation:.5f} — bias cancelled"
+                )
+                return self._no_trade(symbol, rejection_log, utc_now, ctx)
+            if bias == "bearish" and current_price > ctx.invalidation:
+                rejection_log.append(
+                    f"Price {current_price:.5f} broke invalidation "
+                    f"{ctx.invalidation:.5f} — bias cancelled"
+                )
+                return self._no_trade(symbol, rejection_log, utc_now, ctx)
 
-        bias = trend_h4  # bullish | bearish
+        # ── STEP 3: Price must be in entry zone ───────────────────
+        in_zone = check_in_entry_zone(current_price, ctx)
+        if not in_zone:
+            rejection_log.append(
+                f"Price {current_price:.5f} not in entry zone "
+                f"[{ctx.entry_zone_low:.5f} – {ctx.entry_zone_high:.5f}]"
+            )
 
-        # ── STEP 2: Market Structure ──────────────────────────────
-        structure = classify_market_structure(df_h1)
-        structure_ok = (structure == bias)
-        if not structure_ok:
-            rejection_log.append(f"Structure ({structure}) conflicts with bias ({bias})")
-            return self._no_trade(symbol, rejection_log, utc_now,
-                                  trend_h4=trend_h4, trend_h1=trend_h1, structure=structure)
+        # ── STEP 4: Today confirmation checks ─────────────────────
+        rejection_candle     = check_rejection_candle(df, bias)
+        cvd_confirmed        = check_cvd_shift(df, bias)
+        absorption_today     = check_absorption_today(df, ctx, bias)
 
-        # ── STEP 3: Liquidity Sweep ───────────────────────────────
-        sweep = detect_liquidity_sweep(df_m15)
-        sweep_ok = (sweep["detected"] and
-                    sweep["direction"] == bias and
-                    sweep["rejection_strength"] > 0.3)
-        if not sweep_ok:
-            rejection_log.append("No valid liquidity sweep on M15")
+        confirmation_count = sum([rejection_candle, cvd_confirmed, absorption_today])
+        if in_zone and confirmation_count == 0:
+            rejection_log.append(
+                "In zone but no confirmation (need rejection candle, CVD shift, or absorption)"
+            )
 
-        # ── STEP 4: Volatility Compression ───────────────────────
-        atr_compressed = is_atr_compressed(df_m15)
-        if not atr_compressed:
-            rejection_log.append("ATR not compressed (no energy buildup)")
-
-        # ── STEP 5: Volume Confirmation ───────────────────────────
-        last_m15   = df_m15.iloc[-1]
-        vol_ratio  = last_m15.get("vol_ratio", 0.0)
-        volume_ok  = vol_ratio >= VOLUME_RATIO_MIN
-        if not volume_ok:
-            rejection_log.append(f"Volume ratio {vol_ratio:.2f} < {VOLUME_RATIO_MIN}")
-
-        # ── STEP 6: Breakout Confirmation ─────────────────────────
-        breakout   = detect_breakout(df_m15)
-        breakout_ok = (breakout["confirmed"] and breakout["direction"] == bias)
-        if not breakout_ok:
-            rejection_log.append("Breakout not confirmed on M15")
-
-        # ── ATR State ─────────────────────────────────────────────
-        atr_expanding = is_atr_expanding(df_m15)
-        if not atr_expanding:
-            rejection_log.append("ATR not yet expanding")
-
-        # ── STEP 12: Confidence Score ─────────────────────────────
+        # ── STEP 5: Confidence score ──────────────────────────────
         checks = {
-            "h4_trend":       trend_h4 == bias,
-            "h1_trend":       trend_h1 == bias,
-            "structure":      structure_ok,
-            "sweep":          sweep_ok,
-            "volume":         volume_ok,
-            "breakout":       breakout_ok,
-            "atr_compressed": atr_compressed,
-            "atr_expanding":  atr_expanding,
-            "rr_min":         True,  # resolved below
+            "yest_vol_bias":    ctx.profile.bias == bias,
+            "yest_cvd_bias":    ctx.cvd.bias     == bias,
+            "cvd_divergence":   ctx.cvd.divergence,
+            "absorption_zone":  len([z for z in ctx.absorptions if z.strength > 0.5]) > 0,
+            "in_entry_zone":    in_zone,
+            "rejection_candle": rejection_candle,
+            "cvd_confirmed":    cvd_confirmed,
+            "absorption_today": absorption_today,
+            "rr_ok":            True,  # resolved below
         }
         confidence = compute_confidence(checks)
 
         if confidence < MIN_CONFIDENCE:
-            rejection_log.append(f"Confidence {confidence} below minimum {MIN_CONFIDENCE}")
-            return self._no_trade(symbol, rejection_log, utc_now,
-                                  trend_h4=trend_h4, trend_h1=trend_h1, structure=structure)
+            rejection_log.append(f"Confidence {confidence} < minimum {MIN_CONFIDENCE}")
+            return self._no_trade(symbol, rejection_log, utc_now, ctx)
 
-        # ── STEP 8: Entry / SL / TP ───────────────────────────────
-        atr_val   = last_m15["atr"]
-        tick      = df_m15.iloc[-1]
-        direction = "LONG" if bias == "bullish" else "SHORT"
+        # ── STEP 6: Entry / SL / TP ───────────────────────────────
+        atr_val   = float(df.iloc[-1]["atr"])
+        entry     = current_price
 
         if direction == "LONG":
-            entry     = tick["close"]
-            stop_loss = sweep["sweep_price"] - atr_val * 0.2 if sweep_ok else entry - atr_val * 1.5
-            tp1       = entry + atr_val * TP1_ATR_MULT
-            tp2       = entry + atr_val * TP2_ATR_MULT
-            # TP3: find nearest resistance (previous swing high)
-            sh_vals   = df_h1["high"][df_h1["swing_high"]].values
-            tp3       = sh_vals[-1] if len(sh_vals) > 0 else tp2 * 1.005
+            # SL below the entry zone low (or absorption zone if present)
+            sl_anchor  = ctx.entry_zone_low
+            stop_loss  = sl_anchor - atr_val * 0.5
+            tp1        = entry + atr_val * TP1_ATR_MULT
+            tp2        = entry + atr_val * TP2_ATR_MULT
+            # TP3: yesterday high then beyond
+            tp3        = ctx.high + (ctx.high - ctx.low) * 0.382
         else:  # SHORT
-            entry     = tick["close"]
-            stop_loss = sweep["sweep_price"] + atr_val * 0.2 if sweep_ok else entry + atr_val * 1.5
-            tp1       = entry - atr_val * TP1_ATR_MULT
-            tp2       = entry - atr_val * TP2_ATR_MULT
-            sl_vals   = df_h1["low"][df_h1["swing_low"]].values
-            tp3       = sl_vals[-1] if len(sl_vals) > 0 else tp2 * 0.995
+            sl_anchor  = ctx.entry_zone_high
+            stop_loss  = sl_anchor + atr_val * 0.5
+            tp1        = entry - atr_val * TP1_ATR_MULT
+            tp2        = entry - atr_val * TP2_ATR_MULT
+            tp3        = ctx.low  - (ctx.high - ctx.low) * 0.382
 
         risk   = abs(entry - stop_loss)
         reward = abs(tp1   - entry)
         rr     = round(reward / risk, 2) if risk > 0 else 0.0
-        checks["rr_min"] = rr >= MIN_RR
+        checks["rr_ok"] = rr >= MIN_RR
         confidence = compute_confidence(checks)
 
         if rr < MIN_RR:
             rejection_log.append(f"R:R {rr:.2f} below minimum 1:{MIN_RR}")
-            return self._no_trade(symbol, rejection_log, utc_now,
-                                  trend_h4=trend_h4, trend_h1=trend_h1, structure=structure)
+            return self._no_trade(symbol, rejection_log, utc_now, ctx)
 
         lot_size = calculate_lot_size(self.balance, self.risk_pct, entry, stop_loss)
 
-        # ── STEP 13: Decision ─────────────────────────────────────
-        if confidence >= 90:
-            decision = "EXECUTE TRADE"
-        elif confidence >= 80:
+        # ── STEP 7: Decision ──────────────────────────────────────
+        if confidence >= 80:
             decision = "EXECUTE TRADE"
         elif confidence >= 70:
             decision = "REVIEW MANUALLY"
         else:
             decision = "NO TRADE"
 
-        signal = TradeSignal(
+        return TradeSignal(
             pair          = symbol,
             direction     = direction,
             confidence    = confidence,
@@ -298,35 +385,37 @@ class SignalEngine:
             risk_reward   = rr,
             lot_size      = lot_size,
             decision      = decision,
-            trend_h4      = trend_h4,
-            trend_h1      = trend_h1,
-            trend_m15     = trend_m15,
-            structure     = structure,
-            sweep         = sweep,
-            volume_ratio  = round(float(vol_ratio), 2),
-            atr_current   = round(float(atr_val), 6),
-            atr_expanding = atr_expanding,
-            atr_compressed= atr_compressed,
-            breakout      = breakout,
+
+            yest_bias         = ctx.bias,
+            yest_poc          = round(ctx.profile.poc, 5),
+            yest_vah          = round(ctx.profile.vah, 5),
+            yest_val          = round(ctx.profile.val, 5),
+            yest_cvd_bias     = ctx.cvd.bias,
+            cvd_divergence    = ctx.cvd.divergence,
+            entry_zone_high   = ctx.entry_zone_high,
+            entry_zone_low    = ctx.entry_zone_low,
+            absorptions_count = len(ctx.absorptions),
+
+            in_entry_zone         = in_zone,
+            rejection_candle      = rejection_candle,
+            cvd_confirmed         = cvd_confirmed,
+            absorption_confirmed  = absorption_today,
+
+            atr_current   = round(atr_val, 6),
             rejection_log = rejection_log,
             timestamp     = utc_now.strftime("%Y-%m-%d %H:%M:%S UTC"),
         )
 
-        logger.info("Signal generated: %s %s conf=%d decision=%s",
-                    symbol, direction, confidence, decision)
-        return signal
-
     # ── Helpers ────────────────────────────────────────────────────
 
     def _prepare(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = add_emas(df)
         df = add_atr(df)
-        df = add_volume_ratio(df)
         df = get_swing_points(df)
         return df
 
     def _no_trade(
-        self, symbol: str, rejection_log: list, utc_now: datetime, **kwargs
+        self, symbol: str, rejection_log: list,
+        utc_now: datetime, ctx: YesterdayContext
     ) -> TradeSignal:
         return TradeSignal(
             pair          = symbol,
@@ -340,65 +429,71 @@ class SignalEngine:
             risk_reward   = 0.0,
             lot_size      = 0.0,
             decision      = "NO TRADE",
+            yest_bias     = ctx.bias if ctx else "",
+            yest_poc      = round(ctx.profile.poc, 5) if ctx else 0.0,
+            yest_vah      = round(ctx.profile.vah, 5) if ctx else 0.0,
+            yest_val      = round(ctx.profile.val, 5) if ctx else 0.0,
             rejection_log = rejection_log,
             timestamp     = utc_now.strftime("%Y-%m-%d %H:%M:%S UTC"),
-            **kwargs,
         )
 
 
 # ─── Formatter ────────────────────────────────────────────────────
 
 def format_signal(sig: TradeSignal) -> str:
-    """Render signal in the Step 13 output format."""
     if sig.direction == "NO_TRADE":
         lines = [
-            f"PAIR: {sig.pair}",
-            f"DIRECTION: NO TRADE",
+            "=" * 52,
+            f"PAIR:      {sig.pair}",
+            f"DECISION:  NO TRADE",
             f"TIMESTAMP: {sig.timestamp}",
+            f"YESTERDAY: POC={sig.yest_poc}  VAH={sig.yest_vah}  VAL={sig.yest_val}",
             "REASONS:",
         ] + [f"  • {r}" for r in sig.rejection_log]
+        lines.append("=" * 52)
         return "\n".join(lines)
 
     conf_label = (
         "Institutional Grade" if sig.confidence >= 90 else
         "High Quality"        if sig.confidence >= 80 else
-        "Moderate Quality"    if sig.confidence >= 70 else
+        "Moderate"            if sig.confidence >= 70 else
         "Below Threshold"
     )
 
-    sweep_info = (
-        f"Previous {'Low' if sig.direction == 'LONG' else 'High'} Swept "
-        f"(rej={sig.sweep.get('rejection_strength', 0):.2%})"
-        if sig.sweep.get("detected") else "Not Detected"
-    )
+    tick = "✔" if True else "✘"   # helper
 
     lines = [
         "=" * 52,
-        f"PAIR:             {sig.pair}",
-        f"DIRECTION:        {sig.direction}",
-        f"CONFIDENCE:       {sig.confidence}/100  [{conf_label}]",
-        f"TIMESTAMP:        {sig.timestamp}",
+        f"PAIR:              {sig.pair}",
+        f"DIRECTION:         {sig.direction}",
+        f"CONFIDENCE:        {sig.confidence}/100  [{conf_label}]",
+        f"TIMESTAMP:         {sig.timestamp}",
         "-" * 52,
-        f"TREND:",
-        f"  H4              {sig.trend_h4.upper()}",
-        f"  H1              {sig.trend_h1.upper()}",
-        f"  M15             {sig.trend_m15.upper()}",
-        f"MARKET STRUCTURE: {sig.structure.upper()}",
-        f"LIQUIDITY EVENT:  {sweep_info}",
-        f"VOLUME RATIO:     {sig.volume_ratio}x Average",
-        f"ATR:              {sig.atr_current:.6f}  "
-        f"({'EXPANDING' if sig.atr_expanding else 'FLAT'} / "
-        f"{'COMPRESSED' if sig.atr_compressed else 'NORMAL'})",
+        "YESTERDAY CONTEXT:",
+        f"  Bias             {sig.yest_bias.upper()}",
+        f"  POC              {sig.yest_poc}",
+        f"  VAH              {sig.yest_vah}",
+        f"  VAL              {sig.yest_val}",
+        f"  CVD Bias         {sig.yest_cvd_bias.upper()}",
+        f"  CVD Divergence   {'YES ⚡' if sig.cvd_divergence else 'No'}",
+        f"  Absorption Zones {sig.absorptions_count}",
         "-" * 52,
-        f"ENTRY:            {sig.entry:.5f}",
-        f"STOP LOSS:        {sig.stop_loss:.5f}",
-        f"TAKE PROFIT 1:    {sig.tp1:.5f}",
-        f"TAKE PROFIT 2:    {sig.tp2:.5f}",
-        f"TAKE PROFIT 3:    {sig.tp3:.5f}",
-        f"RISK REWARD:      1:{sig.risk_reward}",
-        f"LOT SIZE:         {sig.lot_size}",
+        "TODAY CONFIRMATION:",
+        f"  In Entry Zone    {'✔' if sig.in_entry_zone        else '✘'}  [{sig.entry_zone_low} – {sig.entry_zone_high}]",
+        f"  Rejection Candle {'✔' if sig.rejection_candle     else '✘'}",
+        f"  CVD Shift        {'✔' if sig.cvd_confirmed        else '✘'}",
+        f"  Absorption Today {'✔' if sig.absorption_confirmed else '✘'}",
         "-" * 52,
-        f"DECISION:         {sig.decision}",
+        f"ENTRY:             {sig.entry}",
+        f"STOP LOSS:         {sig.stop_loss}",
+        f"TP1:               {sig.tp1}",
+        f"TP2:               {sig.tp2}",
+        f"TP3:               {sig.tp3}",
+        f"RISK REWARD:       1:{sig.risk_reward}",
+        f"LOT SIZE:          {sig.lot_size}",
+        f"ATR:               {sig.atr_current}",
+        "-" * 52,
+        f"DECISION:          {sig.decision}",
         "=" * 52,
     ]
     if sig.rejection_log:
