@@ -39,7 +39,7 @@ from config.settings import (
     TP2_ATR_MULT,
 )
 from core.indicators import add_atr, get_swing_points
-from core.volume_profile import YesterdayContext, YesterdayContextBuilder
+from core.context_builder import YesterdayContext, YesterdayContextBuilder
 
 logger = logging.getLogger(__name__)
 
