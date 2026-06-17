@@ -122,25 +122,18 @@ class TradingBot:
 
     def _process_symbol(self, symbol, utc_now, news_events):
         df_m15 = self.mt5.get_ohlcv(symbol, "M15")
+        df_h1  = self.mt5.get_ohlcv(symbol, "H1")
+        df_h4  = self.mt5.get_ohlcv(symbol, "H4")
 
-        if df_m15 is None or df_m15.empty:
+        if df_m15 is None or df_m15.empty or df_h1 is None or df_h1.empty or df_h4 is None or df_h4.empty:
             logger.warning("Skipping %s — missing data.", symbol)
             return
-
-        # Extract yesterday's context from M15 history
-        dates = pd.Series(df_m15.index.date).unique()
-        if len(dates) < 2:
-            logger.warning("Skipping %s — not enough history for yesterday's context.", symbol)
-            return
-            
-        prev_date = dates[-2]
-        df_yesterday = df_m15[df_m15.index.date == prev_date]
-        ctx = self.engine.build_yesterday_context(df_yesterday)
 
         signal = self.engine.evaluate(
             symbol     = symbol,
             df_m15     = df_m15,
-            ctx        = ctx,
+            df_h1      = df_h1,
+            df_h4      = df_h4,
             news_times = news_events,
             utc_now    = utc_now,
         )
