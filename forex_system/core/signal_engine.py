@@ -37,9 +37,9 @@ class TradeSignal:
     tp1:             float
     tp2:             float = 0.0
     tp3:             float = 0.0
-    risk_reward:     float
-    lot_size:        float
-    decision:        str        # EXECUTE TRADE | REVIEW MANUALLY | NO TRADE
+    risk_reward:     float = 0.0
+    lot_size:        float = 0.0
+    decision:        str   = "NO TRADE"
     
     # Three strikes extras
     swing_1:           float = 0.0
