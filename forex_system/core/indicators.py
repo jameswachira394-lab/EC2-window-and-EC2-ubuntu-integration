@@ -229,3 +229,32 @@ def is_atr_compressed(df: pd.DataFrame) -> bool:
     if pd.isna(last["atr_ma"]):
         return False
     return last["atr"] < last["atr_ma"]
+
+
+# ── Three Strikes Extras ───────────────────────────────────────────
+
+def add_emas(df: pd.DataFrame, fast: int = EMA_FAST, slow: int = EMA_SLOW) -> pd.DataFrame:
+    """Adds 'ema_fast' and 'ema_slow' columns using pandas ewm(span=N, adjust=False)."""
+    df = df.copy()
+    df["ema_fast"] = df["close"].ewm(span=fast, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=slow, adjust=False).mean()
+    return df
+
+
+def classify_trend_ema(df: pd.DataFrame) -> str:
+    """
+    Returns 'bullish' if close > ema_fast > ema_slow,
+    'bearish' if close < ema_fast < ema_slow,
+    else 'neutral'.
+    """
+    if len(df) == 0:
+        return "neutral"
+    last = df.iloc[-1]
+    c = last["close"]
+    f = last["ema_fast"]
+    s = last["ema_slow"]
+    if c > f and f > s:
+        return "bullish"
+    elif c < f and f < s:
+        return "bearish"
+    return "neutral"
