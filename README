@@ -4,7 +4,7 @@
 4. [Component Reference](#4-component-reference)
    - 4.1 [Ubuntu Trading Engine (`forex_system/`)](#41-ubuntu-trading-engine-forex_system)
    - 4.2 [Windows MT5 Execution Server (`mt5-executor/`)](#42-windows-mt5-execution-server-mt5-executor)
-5. [Signal Pipeline — 13 Steps](#5-signal-pipeline--13-steps)
+5. [Signal Pipeline — Three Strikes Reversal](#5-signal-pipeline--three-strikes-reversal)
 6. [Configuration Reference](#6-configuration-reference)
 7. [API Reference (MT5 Execution Server)](#7-api-reference-mt5-execution-server)
 8. [Deployment Guide](#8-deployment-guide)
@@ -50,7 +50,7 @@ The Ubuntu container has **zero MetaTrader5 dependency**. It communicates with t
 │   │  main.py (TradingBot orchestrator)           │    │
 │   │    │                                         │    │
 │   │    ├── MT5Connector  ──► HTTP OHLCV & Ticks      │    │
-│   │    ├── SignalEngine  ──► 13-step pipeline    │    │
+│   │    ├── SignalEngine  ──► Three Strikes logic │    │
 │   │    ├── RiskManager  ──► drawdown / halts     │    │
 │   │    ├── SignalLogger  ──► CSV audit trail      │    │
 │   │    └── ExecutionClient ─────────────────┐    │    │
@@ -94,7 +94,7 @@ Every N seconds:
   3. RiskManager.can_trade() ──► check drawdown limits
   4. For each symbol:
        a. MT5Connector.get_ohlcv(H4, H1, M15)
-       b. SignalEngine.evaluate() ──► 13-step analysis
+       b. SignalEngine.evaluate() ──► Three Strikes analysis
        c. SignalLogger.log()      ──► append to CSV
        d. If EXECUTE TRADE:
             ExecutionClient.place_order()
@@ -122,7 +122,7 @@ forex_system/                      ← Git root
 │   │   └── execution_client.py   ← HTTP client → Windows MT5 server
 │   │
 │   ├── core/
-│   │   ├── signal_engine.py      ← 13-step signal pipeline
+│   │   ├── signal_engine.py      ← Three Strikes Reversal strategy
 │   │   ├── indicators.py         ← EMA, ATR, volume, swing points
 │   │   └── risk_manager.py       ← Daily/weekly loss limits, streak guard
 │   │
@@ -199,7 +199,7 @@ Falls back to `http://10.0.1.153:8000` if not set.
 
 #### `core/signal_engine.py` — SignalEngine
 
-Implements the full 13-step institutional signal pipeline. Returns a `TradeSignal` dataclass.
+Implements the full Three Strikes Reversal pipeline. Returns a `TradeSignal` dataclass.
 
 **`TradeSignal` fields:**
 
@@ -214,30 +214,31 @@ Implements the full 13-step institutional signal pipeline. Returns a `TradeSigna
 | `risk_reward` | `float` | Reward-to-risk ratio |
 | `lot_size` | `float` | Calculated lot size |
 | `decision` | `str` | `EXECUTE TRADE` / `REVIEW MANUALLY` / `NO TRADE` |
-| `rejection_log` | `list[str]` | Reasons why trade was skipped |
+| `swing_1/2/3` | `float` | Prices of the three swing points |
+| `trendline_slope/r2` | `float` | Slope and R-squared of the trendline |
+| `third_touch_price` | `float` | Projected trendline value at the 3rd touch |
+| `rejection_log` | `list[str]` | Reasons why trade was skipped or score criteria (✔/✘) |
 
-**Confidence scoring weights:**
+**Confidence scoring weights (cap at 100):**
 
 | Check | Weight |
 |---|---|
-| H4 trend aligned | 20 |
-| H1 trend aligned | 15 |
-| Market structure | 15 |
-| Liquidity sweep | 15 |
-| Volume confirmation | 12 |
-| Breakout confirmed | 10 |
-| ATR compressed | 5 |
-| ATR expanding | 5 |
-| R:R ≥ minimum | 3 |
-| **Total** | **100** |
+| H4 trend aligned | +20 |
+| H1 trend aligned | +15 |
+| Trendline R² ≥ 0.85 | +20 |
+| Third touch within 0.5× ATR | +15 |
+| Volume at 3rd touch ≥ 1.2× mean | +10 |
+| ATR expanding at 3rd touch | +10 |
+| Swing points strictly aligned | +10 |
+| *Penalty: <3 candles between swings* | *-10* |
 
 **Decision thresholds:**
 
 | Confidence | Decision |
 |---|---|
-| ≥ 80 | `EXECUTE TRADE` |
-| 70–79 | `REVIEW MANUALLY` |
-| < 70 | `NO TRADE` |
+| ≥ 75 | `EXECUTE TRADE` |
+| 55–74 | `REVIEW MANUALLY` |
+| < 55 | `NO TRADE` |
 
 ---
 
@@ -339,23 +340,21 @@ Called once at server startup. MT5 desktop app must be open and logged into your
 
 ---
 
-## 5. Signal Pipeline — 13 Steps
+## 5. Signal Pipeline — Three Strikes Reversal
 
 | Step | Filter / Check | Pass Condition |
 |---|---|---|
-| 1 | **H4 / H1 Trend bias** | H4 and H1 EMA trend must agree (both bullish or both bearish) |
-| 2 | **Market Structure** | H1 swing structure (HH/HL or LH/LL) must match the trend bias |
-| 3 | **Liquidity Sweep** | M15 must show wick rejection after sweeping a prior swing point |
-| 4 | **ATR Compression** | Current ATR < 20-period ATR average (energy buildup) |
-| 5 | **Volume Confirmation** | Last M15 candle volume ≥ 1.5× the 20-period average |
-| 6 | **Breakout Confirmation** | M15 close outside 10-bar consolidation range + above/below prior swing |
-| 7 | *(ATR Expansion)* | ATR expanding (bonus score, not hard gate) |
-| 8 | **Entry / SL / TP** | Entry at current close; SL below sweep price; TP1/2 at 2×/3× ATR |
-| 9 | **Lot Size** | Risk-based: `risk_amount / (pips_at_risk × pip_value)` |
-| 10 | **Session Filter** | UTC hour must be within London/NY window (07:00–21:00 UTC) |
-| 11 | **News Blackout** | No high-impact event within ±30 minutes |
-| 12 | **Confidence Score** | Weighted sum of all checks ≥ `MIN_CONFIDENCE` (default 70) |
-| 13 | **Decision** | ≥80 → Execute; 70–79 → Review; <70 → No Trade |
+| 1 | **Trend Context** | H4 and H1 EMA trend aligned with setup direction (bullish for SELL, bearish for BUY) |
+| 2 | **Swing Points** | Detect at least 2 strictly descending lows (Buy) or ascending highs (Sell) on M15 |
+| 3 | **Trendline** | Fit a line through the 2 swing points using linear regression and project it |
+| 4 | **Third Touch** | Current M15 price must touch the projected trendline within 1× ATR |
+| 5 | **Entry / SL / TP** | Entry at current close; SL beyond 2nd swing point; TP at nearest opposing swing point |
+| 6 | **Lot Size** | Risk-based: `risk_amount / (pips_at_risk × pip_value)` |
+| 7 | **Session Filter (Gate)** | UTC hour must be within London/NY window (07:00–21:00 UTC) |
+| 8 | **News Blackout (Gate)**| No high-impact event within ±30 minutes |
+| 9 | **RR Minimum (Gate)** | R:R ≥ `MIN_RR` (default 2.0) |
+| 10 | **Confidence Score** | Weighted sum of all checks ≥ `MIN_CONFIDENCE` (default 75) |
+| 11 | **Decision** | ≥75 → Execute; 55–74 → Review; <55 → No Trade |
 
 ---
 
@@ -634,10 +633,8 @@ Every evaluated signal (including NO_TRADE) is appended. Columns:
 ```
 timestamp, pair, direction, confidence, decision,
 entry, stop_loss, tp1, tp2, tp3, risk_reward, lot_size,
-trend_h4, trend_h1, trend_m15, structure,
-volume_ratio, atr_current, atr_expanding, atr_compressed,
-sweep_detected, sweep_direction, sweep_rejection,
-breakout_confirmed, breakout_direction,
+swing_1, swing_2, swing_3, trendline_slope, trendline_r2,
+third_touch_price,
 rejection_reasons
 ```
 
