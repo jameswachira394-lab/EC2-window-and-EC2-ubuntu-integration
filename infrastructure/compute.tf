@@ -76,7 +76,7 @@ data "aws_ami" "windows" {
   }
 }
 
-# ---------------- Windows EC2 ----------------
+# Windows EC2 
 
 resource "aws_instance" "windows" {
   ami           = data.aws_ami.windows.id
