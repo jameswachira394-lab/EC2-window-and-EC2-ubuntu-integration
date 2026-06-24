@@ -1,4 +1,4 @@
-# ---------------- Ubuntu EC2 (Canonical Stable AMI) ----------------
+# ---------------- Ubuntu EC2 (Canonical Stable AMI) -------
 
 data "aws_ami" "ubuntu" {
   most_recent = true
