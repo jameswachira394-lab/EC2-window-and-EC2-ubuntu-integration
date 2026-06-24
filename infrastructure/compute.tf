@@ -53,7 +53,7 @@ resource "aws_instance" "ubuntu" {
   }
 }
 
-# ---------------- Windows AMI (Hardened Filter) ----------------
+#  Windows AMI (Hardened Filter)
 
 data "aws_ami" "windows" {
   most_recent = true
