@@ -1,6 +1,6 @@
 1. [System Overview](#1-system-overview)
 2. [Architecture](#2-architecture)
-3. [Repository Structure](#3-repository-structure)
+3. [Repository Structure](#3-repository-structures)
 4. [Component Reference](#4-component-reference)
    - 4.1 [Ubuntu Trading Engine (`forex_system/`)](#41-ubuntu-trading-engine-forex_system)
    - 4.2 [Windows MT5 Execution Server (`mt5-executor/`)](#42-windows-mt5-execution-server-mt5-executor)
